@@ -78,6 +78,7 @@ static void run_benchmark(moq_track_type_t track_type, uint8_t flags,
   server_cfg.cert_file = "t/assets/server.crt";
   server_cfg.key_file = "t/assets/server.key";
   server_cfg.callback = on_server_event;
+  server_cfg.allow_insecure_peer = true;
   server_cfg.user_data = &server_state;
   server_cfg.simulated_loss_rate = 0; /* Rely strictly on kernel tc loss */
 
@@ -90,6 +91,7 @@ static void run_benchmark(moq_track_type_t track_type, uint8_t flags,
   client_cfg.cert_file = NULL;
   client_cfg.key_file = NULL;
   client_cfg.callback = on_client_event;
+  client_cfg.allow_insecure_peer = true;
   client_cfg.user_data = &client_state;
   client_cfg.simulated_loss_rate = 0; /* Rely strictly on kernel tc loss */
 
@@ -129,6 +131,12 @@ static void run_benchmark(moq_track_type_t track_type, uint8_t flags,
 
   /* allocate test payload */
   uint8_t *payload = malloc(PAYLOAD_SIZE);
+  if (!payload) {
+    fprintf(stderr, "Failed to allocate benchmark payload\n");
+    transport_destroy(client_state.transport);
+    transport_destroy(server_state.transport);
+    return;
+  }
   memset(payload, 0xA5, PAYLOAD_SIZE);
 
   struct timespec send_times[OBJECTS_PER_RUN];

@@ -74,6 +74,7 @@ int main(void) {
   server_cfg.cert_file = "t/assets/server.crt";
   server_cfg.key_file = "t/assets/server.key";
   server_cfg.callback = on_server_event;
+  server_cfg.allow_insecure_peer = true;
   server_cfg.user_data = &server_state;
   server_cfg.simulated_loss_rate = 20; /* 20% loss on primary link */
 
@@ -89,6 +90,7 @@ int main(void) {
   client_cfg.cert_file = NULL;
   client_cfg.key_file = NULL;
   client_cfg.callback = on_client_event;
+  client_cfg.allow_insecure_peer = true;
   client_cfg.user_data = &client_state;
   client_cfg.simulated_loss_rate = 0; /* clean secondary link for NACK repair */
 
@@ -130,6 +132,12 @@ int main(void) {
 
   /* publish payload objects over multipath track */
   uint8_t *payload = malloc(PAYLOAD_SIZE);
+  if (!payload) {
+    fprintf(stderr, "Failed to allocate test payload\n");
+    transport_destroy(client_state.transport);
+    transport_destroy(server_state.transport);
+    return 1;
+  }
   memset(payload, 0xDE, PAYLOAD_SIZE);
 
   printf("Publishing %d objects (%d bytes total) with 20%% loss on primary "

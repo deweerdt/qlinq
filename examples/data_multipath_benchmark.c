@@ -153,6 +153,7 @@ int main(int argc, char **argv) {
                                    .cert_file = "t/assets/server.crt",
                                    .key_file = "t/assets/server.key",
                                    .callback = on_server_event,
+                                   .allow_insecure_peer = true,
                                    .user_data = &server_state};
   server_cfg.num_bind_hosts = num_server_bind;
   for (int i = 0; i < num_server_bind; i++)
@@ -163,6 +164,7 @@ int main(int argc, char **argv) {
                                    .cert_file = NULL,
                                    .key_file = NULL,
                                    .callback = on_client_event,
+                                   .allow_insecure_peer = true,
                                    .user_data = &client_state};
   client_cfg.num_bind_hosts = num_client_bind;
   for (int i = 0; i < num_client_bind; i++)

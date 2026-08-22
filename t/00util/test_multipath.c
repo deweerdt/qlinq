@@ -53,6 +53,7 @@ struct transport_t_internal {
   size_t num_fds;
   struct sockaddr_storage local_addrs[TEST_MAX_PATHS];
   socklen_t local_addrs_len[TEST_MAX_PATHS];
+  uint32_t local_ifindices[TEST_MAX_PATHS];
 
   /* client connection */
   struct sockaddr_storage remote_addrs[TEST_MAX_PATHS];
@@ -227,6 +228,7 @@ int main(void) {
   server_cfg.cert_file = "t/assets/server.crt";
   server_cfg.key_file = "t/assets/server.key";
   server_cfg.callback = on_server_event;
+  server_cfg.allow_insecure_peer = true;
   server_cfg.user_data = &server_state;
 
   /* client initially binds only to 127.0.1.2 */
@@ -242,6 +244,7 @@ int main(void) {
   client_cfg.cert_file = NULL;
   client_cfg.key_file = NULL;
   client_cfg.callback = on_client_event;
+  client_cfg.allow_insecure_peer = true;
   client_cfg.user_data = &client_state;
 
   printf("creating transports...\n");

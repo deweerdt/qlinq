@@ -9,6 +9,12 @@ t/00util/test_inputd
 t/00util/test_videod
 t/00util/test_audiod
 t/00util/test_tund
+t/00util/test_data_uds
+t/00util/test_benchmark
+t/00util/test_rateless_benchmark
+t/00util/test_tc_benchmark
+t/00util/test_multipath
+t/00util/test_multipath_nack
 t/assets/
 *.o
 *.a

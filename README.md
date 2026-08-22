@@ -24,6 +24,19 @@ This produces two main binaries:
 - `qlinqd`: The background peer-to-peer network daemon.
 - `qlinq-tund`: The lightweight virtual TUN/TAP interface controller.
 
+## Security
+
+`qlinqd` requires an application authentication token and verifies peer
+certificates by default. Supply the token through `QLINQ_AUTH_TOKEN` or
+`--auth-token`, and use `--ca` when peers are signed by a private CA. For local
+testing only, certificate verification can be disabled explicitly with
+`--insecure-no-verify`.
+
+```bash
+QLINQ_AUTH_TOKEN='replace-with-a-secret' \
+  ./qlinqd --listen 8888 --cert peer.crt --key peer.key --ca mesh-ca.crt
+```
+
 ## Testing
 
 To run the test suite:

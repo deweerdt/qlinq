@@ -14,6 +14,9 @@ typedef struct {
   uint8_t received_data[100];
   size_t received_size;
   transport_t *transport;
+  int data_subscriptions;
+  bool data_a_received;
+  bool data_b_received;
 } test_state_t;
 
 static void on_server_event(void *user_data, const transport_event_t *event) {
@@ -37,6 +40,12 @@ static void on_server_event(void *user_data, const transport_event_t *event) {
     } else if (event->track_id.type == MOQ_TRACK_VIDEO &&
                strcmp(event->track_id.name, "video_track") == 0) {
       state->subscribed = true;
+    } else if ((event->track_id.type == MOQ_TRACK_DATA &&
+                (strcmp(event->track_id.name, "data-a") == 0 ||
+                 strcmp(event->track_id.name, "data-b") == 0)) ||
+               (event->track_id.type == MOQ_TRACK_AUDIO &&
+                strcmp(event->track_id.name, "queue-limit") == 0)) {
+      state->data_subscriptions++;
     }
     break;
   case TRANSPORT_EVENT_AUTH:
@@ -124,6 +133,12 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
         memcpy(state->received_data, event->object.data, event->object.size);
         state->received_data[event->object.size] = '\0';
       }
+    } else if (event->track_id.type == MOQ_TRACK_DATA &&
+               strcmp(event->track_id.name, "data-a") == 0) {
+      state->data_a_received = true;
+    } else if (event->track_id.type == MOQ_TRACK_DATA &&
+               strcmp(event->track_id.name, "data-b") == 0) {
+      state->data_b_received = true;
     }
     break;
   default:
@@ -135,6 +150,25 @@ int main(void) {
   test_state_t server_state = {0};
   test_state_t client_state = {0};
 
+  transport_config_t rejected_cfg = {0};
+  rejected_cfg.bind_hosts[0] = "127.0.0.1";
+  rejected_cfg.num_bind_hosts = 1;
+  rejected_cfg.port = 9998;
+  rejected_cfg.cert_file = "t/assets/server.crt";
+  rejected_cfg.key_file = "t/assets/server.key";
+  rejected_cfg.callback = on_server_event;
+  if (transport_create(&rejected_cfg) != NULL) {
+    fprintf(stderr,
+            "insecure transport was accepted without explicit opt-in\n");
+    return 1;
+  }
+  rejected_cfg.allow_insecure_peer = true;
+  rejected_cfg.num_bind_hosts = TRANSPORT_MAX_PATHS + 1;
+  if (transport_create(&rejected_cfg) != NULL) {
+    fprintf(stderr, "oversized path configuration was accepted\n");
+    return 1;
+  }
+
   /* create server transport config */
   transport_config_t server_cfg = {0};
   server_cfg.bind_hosts[0] = "127.0.0.1";
@@ -143,6 +177,7 @@ int main(void) {
   server_cfg.cert_file = "t/assets/server.crt";
   server_cfg.key_file = "t/assets/server.key";
   server_cfg.callback = on_server_event;
+  server_cfg.allow_insecure_peer = true;
   server_cfg.user_data = &server_state;
 
   /* create client transport config */
@@ -155,6 +190,7 @@ int main(void) {
   client_cfg.cert_file = NULL;
   client_cfg.key_file = NULL;
   client_cfg.callback = on_client_event;
+  client_cfg.allow_insecure_peer = true;
   client_cfg.user_data = &client_state;
 
   printf("creating server and client transports...\n");
@@ -260,6 +296,89 @@ int main(void) {
     transport_destroy(server);
     return 1;
   }
+
+  moq_track_id_t data_a = {.type = MOQ_TRACK_DATA,
+                           .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                           .name = "data-a"};
+  moq_track_id_t data_b = {.type = MOQ_TRACK_DATA,
+                           .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
+                           .name = "data-b"};
+  moq_track_id_t queue_track = {
+      .type = MOQ_TRACK_AUDIO, .flags = 0, .name = "queue-limit"};
+  if (!transport_subscribe(client, data_a) ||
+      !transport_subscribe(client, data_b) ||
+      !transport_subscribe(client, queue_track)) {
+    fprintf(stderr, "edge-case subscriptions failed\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+  retries = 100;
+  while (retries-- > 0 && server_state.data_subscriptions < 3) {
+    transport_tick(server);
+    transport_tick(client);
+    usleep(10 * 1000);
+  }
+
+  const uint8_t packet_a[] = "A";
+  const uint8_t packet_b[] = "B";
+  moq_object_t obj_a = {.track_id = data_a,
+                        .object_id = 10,
+                        .data = packet_a,
+                        .size = sizeof(packet_a)};
+  moq_object_t obj_b = {.track_id = data_b,
+                        .object_id = 11,
+                        .data = packet_b,
+                        .size = sizeof(packet_b)};
+  if (!transport_publish(server, &obj_a) ||
+      !transport_publish(server, &obj_b)) {
+    fprintf(stderr, "mixed-track publication failed\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+  retries = 100;
+  while (retries-- > 0 &&
+         (!client_state.data_a_received || !client_state.data_b_received)) {
+    transport_tick(server);
+    transport_tick(client);
+    usleep(10 * 1000);
+  }
+  if (!client_state.data_a_received || !client_state.data_b_received) {
+    fprintf(stderr, "mixed FEC tracks were not delivered independently\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
+  size_t too_large_size = TRANSPORT_MAX_RELIABLE_OBJECT_SIZE + 1U;
+  uint8_t *too_large = malloc(too_large_size);
+  moq_object_t large_reliable = {.track_id = {.type = MOQ_TRACK_TEXT,
+                                              .flags = MOQ_TRACK_FLAG_RELIABLE,
+                                              .name = "catalog"},
+                                 .data = too_large,
+                                 .size = too_large_size};
+  if (!too_large || transport_publish(server, &large_reliable)) {
+    fprintf(stderr, "oversized reliable object was accepted\n");
+    free(too_large);
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+  free(too_large);
+
+  size_t queue_size = 500000;
+  uint8_t *queue_payload = malloc(queue_size);
+  moq_object_t queue_obj = {
+      .track_id = queue_track, .data = queue_payload, .size = queue_size};
+  if (!queue_payload || transport_publish(server, &queue_obj)) {
+    fprintf(stderr, "object exceeding datagram queue capacity was accepted\n");
+    free(queue_payload);
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+  free(queue_payload);
 
   printf("===TRANSPORT OK===\n");
 

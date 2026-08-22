@@ -106,6 +106,7 @@ int main(void) {
   server_cfg.cert_file = "t/assets/server.crt";
   server_cfg.key_file = "t/assets/server.key";
   server_cfg.callback = on_quic_event;
+  server_cfg.allow_insecure_peer = true;
   server_cfg.user_data = &server_ctx;
   server_ctx.is_server = true;
   server_ctx.transport = transport_create(&server_cfg);
@@ -129,6 +130,7 @@ int main(void) {
   client_cfg.cert_file = NULL;
   client_cfg.key_file = NULL;
   client_cfg.callback = on_quic_event;
+  client_cfg.allow_insecure_peer = true;
   client_cfg.user_data = &client_ctx;
   client_ctx.is_server = false;
   client_ctx.transport = transport_create(&client_cfg);

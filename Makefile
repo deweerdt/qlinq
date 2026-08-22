@@ -91,7 +91,8 @@ qlinqd: $(DAEMON_OBJS)
 	$(CC) -o $@ $(DAEMON_OBJS) $(LDFLAGS)
 
 qlinq-tund: src/host/linux/tund.c
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) -o $@ src/host/linux/tund.c
+	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -o $@ src/host/linux/tund.c \
+		$(LDFLAGS)
 
 examples/data_multipath_benchmark: examples/data_multipath_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ examples/data_multipath_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
@@ -104,6 +105,9 @@ t/00util/test_transport: t/00util/test_transport.o $(COMMON_OBJS)
 
 t/00util/test_tund: t/00util/test_tund.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_tund.o $(COMMON_OBJS) $(LDFLAGS)
+
+t/00util/test_data_uds: t/00util/test_data_uds.o src/common/data_uds.o
+	$(CC) -o $@ t/00util/test_data_uds.o src/common/data_uds.o $(LDFLAGS)
 
 t/00util/test_benchmark: t/00util/test_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
@@ -127,10 +131,10 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
 clean: 
-	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 
-check: qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_multipath t/00util/test_multipath_nack gencerts
+check: qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_multipath t/00util/test_multipath_nack gencerts
 	prove -I. -v t/*.t
 
 t/assets/server.crt t/assets/server.key:
