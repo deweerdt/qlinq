@@ -7,6 +7,7 @@
 #include "data_uds.h"
 #include "portable_sockets.h"
 #include "transport.h"
+#include <openssl/crypto.h>
 #include <poll.h>
 #include <signal.h>
 #include <stdbool.h>
@@ -42,6 +43,9 @@ typedef struct daemon_ctx_s {
   size_t num_subscribe_tracks;
   bool use_reliable;
   bool use_rateless;
+  bool verbose;
+  const char *auth_token;
+  size_t auth_token_len;
 } daemon_ctx_t;
 
 static void subscribe_to_tracks(transport_t *t, daemon_ctx_t *ctx) {
@@ -69,23 +73,24 @@ static void on_transport_event(void *user_data,
   case TRANSPORT_EVENT_CONNECTED:
     printf("peer connected\n");
     if (!tctx->is_server) {
-      transport_send_auth(t, event->conn, (const uint8_t *)"secret_token_123",
-                          strlen("secret_token_123"));
+      transport_send_auth(t, event->conn, (const uint8_t *)ctx->auth_token,
+                          ctx->auth_token_len);
     }
     break;
   case TRANSPORT_EVENT_AUTH:
     if (tctx->is_server) {
       bool success = false;
-      if (event->auth.token_len == strlen("secret_token_123") &&
-          memcmp(event->auth.token, "secret_token_123",
-                 event->auth.token_len) == 0) {
+      if (event->auth.token_len == ctx->auth_token_len &&
+          CRYPTO_memcmp(event->auth.token, ctx->auth_token,
+                        event->auth.token_len) == 0) {
         success = true;
         printf("peer authentication successful\n");
-        subscribe_to_tracks(t, ctx);
       } else {
         printf("peer authentication failed\n");
       }
       transport_respond_auth(t, event->conn, success);
+      if (success)
+        subscribe_to_tracks(t, ctx);
     }
     break;
   case TRANSPORT_EVENT_AUTH_COMPLETE:
@@ -94,6 +99,7 @@ static void on_transport_event(void *user_data,
       subscribe_to_tracks(t, ctx);
     } else {
       fprintf(stderr, "authentication failed, disconnecting from peer\n");
+      transport_close_conn(t, event->conn);
     }
     break;
   case TRANSPORT_EVENT_DISCONNECTED:
@@ -108,7 +114,7 @@ static void on_transport_event(void *user_data,
            event->track_id.name, event->track_id.type);
     break;
   case TRANSPORT_EVENT_OBJECT:
-    if (event->track_id.type == MOQ_TRACK_DATA) {
+    if (ctx->verbose && event->track_id.type == MOQ_TRACK_DATA) {
       printf("daemon: received object from peer on track '%s', size=%zu, "
              "flags=%d, type=%d\n",
              event->track_id.name, event->object.size, event->track_id.flags,
@@ -126,18 +132,19 @@ static void on_transport_event(void *user_data,
         if (remaining < 2 + (size_t)pkt_len) {
           break;
         }
-        printf("daemon: forwarding packet to UDS client, len=%d\n", pkt_len);
-        data_uds_send(ctx->data_pipe, &event->track_id, ptr + 2, pkt_len,
-                      event->object.priority);
+        if (!data_uds_send(ctx->data_pipe, &event->track_id, ptr + 2, pkt_len,
+                           event->object.priority) &&
+            ctx->verbose)
+          fprintf(stderr, "daemon: UDS output queue unavailable\n");
         ptr += 2 + pkt_len;
         remaining -= 2 + pkt_len;
       }
     } else if (ctx->data_pipe) {
       /* Forward raw packet for reliable tracks */
-      printf("daemon: forwarding raw packet to UDS client, len=%zu\n",
-             event->object.size);
-      data_uds_send(ctx->data_pipe, &event->track_id, event->object.data,
-                    event->object.size, event->object.priority);
+      if (!data_uds_send(ctx->data_pipe, &event->track_id, event->object.data,
+                         event->object.size, event->object.priority) &&
+          ctx->verbose)
+        fprintf(stderr, "daemon: UDS output queue unavailable\n");
     }
     break;
   case TRANSPORT_EVENT_OBJECT_LOST:
@@ -165,10 +172,9 @@ static void on_data_packet(void *user_data, const moq_track_id_t *track_id,
   /* Broadcast to all peers */
   for (size_t i = 0; i < ctx->num_transports; i++) {
     if (ctx->transports[i].transport) {
-      printf("daemon: forwarding UDS packet to transport %zu, size=%zu, "
-             "track='%s'\n",
-             i, size, track_id->name);
-      transport_publish(ctx->transports[i].transport, &obj);
+      if (!transport_publish(ctx->transports[i].transport, &obj) &&
+          ctx->verbose)
+        fprintf(stderr, "daemon: transport backpressure rejected object\n");
     }
   }
 }
@@ -272,7 +278,8 @@ int main(int argc, char **argv) {
   const char *cert_file = "t/assets/server.crt";
   const char *key_file = "t/assets/server.key";
   const char *ca_file = NULL;
-  bool verify_peer = false;
+  bool verify_peer = true;
+  bool allow_insecure_peer = false;
   const char *socket_name = "qlinq-data";
 
   for (int i = 1; i < argc; i++) {
@@ -288,6 +295,14 @@ int main(int argc, char **argv) {
       ca_file = argv[++i];
     } else if (strcmp(argv[i], "--verify-peer") == 0) {
       verify_peer = true;
+      allow_insecure_peer = false;
+    } else if (strcmp(argv[i], "--insecure-no-verify") == 0) {
+      verify_peer = false;
+      allow_insecure_peer = true;
+    } else if (strcmp(argv[i], "--auth-token") == 0 && i + 1 < argc) {
+      ctx.auth_token = argv[++i];
+    } else if (strcmp(argv[i], "--verbose") == 0) {
+      ctx.verbose = true;
     } else if ((strcmp(argv[i], "--socket") == 0 ||
                 strcmp(argv[i], "-s") == 0) &&
                i + 1 < argc) {
@@ -308,6 +323,21 @@ int main(int argc, char **argv) {
     }
   }
 
+  if (!ctx.auth_token)
+    ctx.auth_token = getenv("QLINQ_AUTH_TOKEN");
+  if (!ctx.auth_token || ctx.auth_token[0] == '\0') {
+    fprintf(stderr, "an authentication token is required; use --auth-token or "
+                    "QLINQ_AUTH_TOKEN\n");
+    portable_socket_cleanup();
+    return 1;
+  }
+  ctx.auth_token_len = strlen(ctx.auth_token);
+  if (ctx.auth_token_len > UINT16_MAX) {
+    fprintf(stderr, "authentication token is too long\n");
+    portable_socket_cleanup();
+    return 1;
+  }
+
   if (ctx.num_subscribe_tracks == 0) {
     strcpy(ctx.subscribe_tracks[ctx.num_subscribe_tracks++], "bishnc/default");
     strcpy(ctx.subscribe_tracks[ctx.num_subscribe_tracks++], "tund/tun0");
@@ -323,6 +353,7 @@ int main(int argc, char **argv) {
     config.key_file = key_file;
     config.ca_file = ca_file;
     config.verify_peer = verify_peer;
+    config.allow_insecure_peer = allow_insecure_peer;
 
     daemon_transport_ctx_t *tctx = &ctx.transports[ctx.num_transports];
     tctx->daemon = &ctx;
@@ -360,6 +391,7 @@ int main(int argc, char **argv) {
     config.key_file = key_file;
     config.ca_file = ca_file;
     config.verify_peer = verify_peer;
+    config.allow_insecure_peer = allow_insecure_peer;
 
     daemon_transport_ctx_t *tctx = &ctx.transports[ctx.num_transports];
     tctx->daemon = &ctx;

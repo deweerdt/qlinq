@@ -24,7 +24,9 @@
 #include "transport.h"
 #include <arpa/inet.h>
 #include <netinet/in.h>
+#include <stddef.h>
 #include <sys/uio.h>
+#include <sys/wait.h>
 
 #ifdef __APPLE__
 #include <net/if_utun.h>
@@ -228,12 +230,24 @@ static ssize_t tun_write(int fd, const void *data, size_t size) {
 #endif
 }
 
-static void setup_uds_addr(struct sockaddr_un *addr, socklen_t *len,
+static bool setup_uds_addr(struct sockaddr_un *addr, socklen_t *len,
                            const char *name) {
+  if (!name || name[0] == '\0')
+    return false;
+  for (const unsigned char *p = (const unsigned char *)name; *p; p++) {
+    if (!(('a' <= *p && *p <= 'z') || ('A' <= *p && *p <= 'Z') ||
+          ('0' <= *p && *p <= '9') || *p == '-' || *p == '_' || *p == '.'))
+      return false;
+  }
   memset(addr, 0, sizeof(*addr));
   addr->sun_family = AF_UNIX;
-  snprintf(addr->sun_path, sizeof(addr->sun_path), "/tmp/%s.sock", name);
-  *len = sizeof(addr->sun_family) + strlen(addr->sun_path);
+  int written =
+      snprintf(addr->sun_path, sizeof(addr->sun_path), "/tmp/%s.sock", name);
+  if (written < 0 || (size_t)written >= sizeof(addr->sun_path))
+    return false;
+  *len =
+      (socklen_t)(offsetof(struct sockaddr_un, sun_path) + (size_t)written + 1);
+  return true;
 }
 
 static bool read_exact(int fd, void *buf, size_t size) {
@@ -254,16 +268,66 @@ static bool read_exact(int fd, void *buf, size_t size) {
   return true;
 }
 
+static bool write_exact(int fd, const void *buf, size_t size) {
+  size_t written = 0;
+  while (written < size) {
+    ssize_t ret = write(fd, (const uint8_t *)buf + written, size - written);
+    if (ret < 0) {
+      if (errno == EINTR)
+        continue;
+      return false;
+    }
+    if (ret == 0)
+      return false;
+    written += (size_t)ret;
+  }
+  return true;
+}
+
+static int run_command(char *const argv[]) {
+  pid_t pid = fork();
+  if (pid < 0)
+    return -1;
+  if (pid == 0) {
+    int null_fd = open("/dev/null", O_WRONLY);
+    if (null_fd >= 0) {
+      dup2(null_fd, STDERR_FILENO);
+      close(null_fd);
+    }
+    execvp(argv[0], argv);
+    _exit(127);
+  }
+  int status;
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR)
+      return -1;
+  }
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0 ? 0 : -1;
+}
+
 /* configure interface ip and bring it up */
-static void configure_ip_and_up(const char *if_name, const char *ip_cidr) {
+static int configure_ip_and_up(const char *if_name, const char *ip_cidr) {
   char ip[64];
+  char cidr[64];
   char peer_ip[64];
+  if (!if_name || !ip_cidr || strlen(if_name) >= IFNAMSIZ ||
+      strlen(ip_cidr) >= sizeof(cidr))
+    return -1;
+  strcpy(cidr, ip_cidr);
   strncpy(ip, ip_cidr, sizeof(ip) - 1);
   ip[sizeof(ip) - 1] = '\0';
   char *slash = strchr(ip, '/');
   if (slash) {
     *slash = '\0';
+    char *end = NULL;
+    long prefix = strtol(slash + 1, &end, 10);
+    if (!end || *end != '\0' || prefix < 0 || prefix > 32)
+      return -1;
   }
+
+  struct in_addr parsed_ip;
+  if (inet_pton(AF_INET, ip, &parsed_ip) != 1)
+    return -1;
 
   char *last_dot = strrchr(ip, '.');
   if (last_dot) {
@@ -278,22 +342,20 @@ static void configure_ip_and_up(const char *if_name, const char *ip_cidr) {
     strcpy(peer_ip, "10.8.0.2");
   }
 
-  char cmd[512];
 #if defined(__linux__)
-  snprintf(cmd, sizeof(cmd), "ip addr add %s peer %s dev %s 2>/dev/null", ip,
-           peer_ip, if_name);
-  if (system(cmd) != 0) {
-  }
-  snprintf(cmd, sizeof(cmd), "ip link set dev %s up 2>/dev/null", if_name);
-  if (system(cmd) != 0) {
-  }
+  char *addr_argv[] = {"ip",    "addr", "add",           cidr, "peer",
+                       peer_ip, "dev",  (char *)if_name, NULL};
+  char *link_argv[] = {"ip", "link", "set", "dev", (char *)if_name, "up", NULL};
+  if (run_command(addr_argv) != 0 || run_command(link_argv) != 0)
+    return -1;
 #elif defined(__APPLE__) || defined(__OpenBSD__) || defined(__FreeBSD__) ||    \
     defined(__DragonFly__) || defined(__NetBSD__)
-  snprintf(cmd, sizeof(cmd), "ifconfig %s %s %s up 2>/dev/null", if_name, ip,
-           peer_ip);
-  if (system(cmd) != 0) {
-  }
+  char *ifconfig_argv[] = {"ifconfig", (char *)if_name, ip, peer_ip, "up",
+                           NULL};
+  if (run_command(ifconfig_argv) != 0)
+    return -1;
 #endif
+  return 0;
 }
 
 int main(int argc, char **argv) {
@@ -354,8 +416,12 @@ int main(int argc, char **argv) {
     }
 
     /* bring up interface, set MTU and assign IP */
-    configure_ip_and_up(dev_name, ip_addr);
-    tun_set_mtu(dev_name, 1400);
+    if (configure_ip_and_up(dev_name, ip_addr) != 0 ||
+        tun_set_mtu(dev_name, 1400) != 0) {
+      fprintf(stderr, "failed to configure TUN interface %s\n", dev_name);
+      close(tun_fd);
+      return 1;
+    }
     printf("TUN interface %s configured successfully\n", dev_name);
   }
 
@@ -368,7 +434,13 @@ int main(int argc, char **argv) {
       if (uds_fd >= 0) {
         struct sockaddr_un addr;
         socklen_t addr_len;
-        setup_uds_addr(&addr, &addr_len, socket_name);
+        if (!setup_uds_addr(&addr, &addr_len, socket_name)) {
+          fprintf(stderr, "invalid UDS socket name\n");
+          close(uds_fd);
+          if (!mock_mode && tun_fd != -1)
+            close(tun_fd);
+          return 1;
+        }
         if (connect(uds_fd, (struct sockaddr *)&addr, addr_len) != 0) {
           close(uds_fd);
           uds_fd = -1;
@@ -380,8 +452,8 @@ int main(int argc, char **argv) {
         reg_hdr[1] =
             use_reliable ? MOQ_TRACK_FLAG_RELIABLE : MOQ_TRACK_FLAG_FEC_ENABLED;
         reg_hdr[2] = (uint8_t)strlen(track_name);
-        if (write(uds_fd, reg_hdr, 3) != 3 ||
-            write(uds_fd, track_name, reg_hdr[2]) != (ssize_t)reg_hdr[2]) {
+        if (!write_exact(uds_fd, reg_hdr, 3) ||
+            !write_exact(uds_fd, track_name, reg_hdr[2])) {
           close(uds_fd);
           uds_fd = -1;
           usleep(500 * 1000);
@@ -423,20 +495,17 @@ int main(int argc, char **argv) {
       mock_pkt[5] = (uint8_t)((seq >> 8) & 0xFF);
 
       uint32_t pkt_len = sizeof(mock_pkt);
-      ssize_t wret = write(uds_fd, &pkt_len, sizeof(pkt_len));
-      if (wret < 0) {
+      if (!write_exact(uds_fd, &pkt_len, sizeof(pkt_len))) {
         close(uds_fd);
         uds_fd = -1;
         continue;
       }
-      wret = write(uds_fd, &tund_priority, sizeof(tund_priority));
-      if (wret < 0) {
+      if (!write_exact(uds_fd, &tund_priority, sizeof(tund_priority))) {
         close(uds_fd);
         uds_fd = -1;
         continue;
       }
-      wret = write(uds_fd, mock_pkt, pkt_len);
-      if (wret < 0) {
+      if (!write_exact(uds_fd, mock_pkt, pkt_len)) {
         close(uds_fd);
         uds_fd = -1;
         continue;
@@ -452,33 +521,12 @@ int main(int argc, char **argv) {
       ssize_t len = tun_read(tun_fd, packet, sizeof(packet));
       if (len > 0 && uds_fd != -1) {
         uint32_t pkt_len = (uint32_t)len;
-        ssize_t wret = write(uds_fd, &pkt_len, sizeof(pkt_len));
-        if (wret < 0) {
+        if (!write_exact(uds_fd, &pkt_len, sizeof(pkt_len)) ||
+            !write_exact(uds_fd, &tund_priority, sizeof(tund_priority)) ||
+            !write_exact(uds_fd, packet, (size_t)len)) {
           close(uds_fd);
           uds_fd = -1;
           continue;
-        }
-        wret = write(uds_fd, &tund_priority, sizeof(tund_priority));
-        if (wret < 0) {
-          close(uds_fd);
-          uds_fd = -1;
-          continue;
-        }
-        size_t written = 0;
-        bool write_err = false;
-        while (written < (size_t)len) {
-          wret = write(uds_fd, packet + written, len - written);
-          if (wret < 0) {
-            if (errno == EINTR)
-              continue;
-            write_err = true;
-            break;
-          }
-          written += wret;
-        }
-        if (write_err) {
-          close(uds_fd);
-          uds_fd = -1;
         }
       }
     }
@@ -542,6 +590,11 @@ int main(int argc, char **argv) {
           break;
         }
       }
+    }
+
+    if (uds_fd != -1 && (fds[1].revents & (POLLHUP | POLLERR | POLLNVAL))) {
+      close(uds_fd);
+      uds_fd = -1;
     }
   }
 
