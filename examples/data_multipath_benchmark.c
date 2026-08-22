@@ -232,7 +232,7 @@ int main(int argc, char **argv) {
     return 1;
   }
 
-  printf("handshake established. streaming 200 packets at 60fps...\n");
+  printf("handshake established. streaming 600 packets at 60fps...\n");
 
   uint8_t *frame_payload = malloc(PACKET_SIZE);
   memset(frame_payload, 0xAA, PACKET_SIZE);
