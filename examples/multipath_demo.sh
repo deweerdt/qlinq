@@ -19,7 +19,7 @@ unshare -Urn bash -c '
     tc qdisc add dev lo root handle 1: prio bands 4
     
     # Class 1:1 -> Cellular (20ms delay per direction / 80ms RTT)
-    tc qdisc add dev lo parent 1:1 handle 10: netem delay 20ms
+    tc qdisc add dev lo parent 1:1 handle 10: netem delay 40ms
     tc filter add dev lo protocol ip parent 1:0 prio 1 u32 match ip dst 10.0.1.0/24 flowid 1:1
     
     # Path 1 (Cellular)
@@ -43,7 +43,7 @@ unshare -Urn bash -c '
     # Path 2 (Wi-Fi)
     echo "Dynamically bringing up Path 2: Wi-Fi (40ms delay per direction / 80ms RTT, 5% GE burst loss)"
     # Class 1:2 -> Wi-Fi (20ms delay / 80ms RTT, 5% GE loss)
-    tc qdisc add dev lo parent 1:2 handle 20: netem delay 20ms loss gemodel 5% 50% 100% 0.5%
+    tc qdisc add dev lo parent 1:2 handle 20: netem delay 40ms loss gemodel 5% 50% 100% 0.5%
     tc filter add dev lo protocol ip parent 1:0 prio 1 u32 match ip dst 10.0.2.0/24 flowid 1:2
     
     ip link add veth2 type veth peer name veth2_peer
@@ -57,7 +57,7 @@ unshare -Urn bash -c '
     # Path 3 (Satcom)
     echo "Dynamically bringing up Path 3: Satcom (70ms delay per direction / 140ms RTT, 2% loss)"
     # Class 1:3 -> Satcom (35ms delay / 140ms RTT, 2% loss)
-    tc qdisc add dev lo parent 1:3 handle 30: netem delay 35ms loss 2%
+    tc qdisc add dev lo parent 1:3 handle 30: netem delay 70ms loss 2%
     tc filter add dev lo protocol ip parent 1:0 prio 1 u32 match ip dst 10.0.3.0/24 flowid 1:3
     
     ip link add veth3 type veth peer name veth3_peer
@@ -71,7 +71,7 @@ unshare -Urn bash -c '
     # Path 4 (Ethernet)
     echo "Dynamically bringing up Path 4: Ethernet (2ms delay per direction / 4ms RTT, 0.1% loss)"
     # Class 1:4 -> Ethernet (1ms delay / 4ms RTT, 0.1% loss)
-    tc qdisc add dev lo parent 1:4 handle 40: netem delay 1ms loss 0.1%
+    tc qdisc add dev lo parent 1:4 handle 40: netem delay 2ms loss 0.1%
     tc filter add dev lo protocol ip parent 1:0 prio 1 u32 match ip dst 10.0.4.0/24 flowid 1:4
     
     ip link add veth4 type veth peer name veth4_peer
