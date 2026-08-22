@@ -35,7 +35,14 @@ static uint64_t get_time_ns(void) {
 }
 
 #define MAX_CONNECTIONS 32
-#define ASSEMBLER_CACHE_SIZE 128
+#define ASSEMBLER_CACHE_SIZE 32
+#define FEC_MAX_TOTAL_SYMBOLS 1024
+#define FEC_MAX_SYMBOL_SIZE 1500
+#define FEC_MAX_OBJECT_SIZE (1024U * 1024U)
+#define FEC_ASSEMBLER_TIMEOUT_MS 2000
+#define FEC_NACK_DELAY_MS 25
+#define QUICLY_PATH_DATAGRAM_QUEUE_CAPACITY 256
+#define QUICLY_MAX_FLAT_PATHS 64
 
 #define SENT_CACHE_SIZE 256
 
@@ -51,11 +58,15 @@ typedef struct {
   uint16_t capacity_symbols;
   uint16_t capacity_symbol_size;
   uint8_t **buffers;
+  uint8_t *buffer_storage;
   bool *received_mask;
+  bool *missing_mask;
   uint16_t *missing_indices;
   bool decoded;
   uint8_t priority;
   bool nack_sent;
+  int64_t first_symbol_time_ms;
+  int64_t last_activity_time_ms;
   int64_t last_nack_time_ms;
 } frame_assembler_t;
 
@@ -69,13 +80,24 @@ typedef struct {
   size_t fallback_count;
 } arena_t;
 
+typedef struct {
+  uint32_t last_seen;
+  uint32_t pending_base;
+  uint32_t pending_mask;
+  uint32_t group_id;
+  int64_t detected_at_ms;
+} object_gap_state_t;
+
 static void *arena_alloc(arena_t *a, size_t size) {
+  if (!a || size > SIZE_MAX - 7)
+    return NULL;
   size = (size + 7) & ~7;
-  if (a->offset + size > a->capacity) {
-    void *ptr = malloc(size);
-    if (ptr && a->fallback_count < ARENA_MAX_FALLBACKS) {
+  if (size > a->capacity - a->offset) {
+    if (a->fallback_count >= ARENA_MAX_FALLBACKS)
+      return NULL;
+    void *ptr = calloc(1, size);
+    if (ptr)
       a->fallbacks[a->fallback_count++] = ptr;
-    }
     return ptr;
   }
   void *ptr = a->buffer + a->offset;
@@ -124,6 +146,7 @@ struct transport_t {
   size_t num_fds;
   struct sockaddr_storage local_addrs[TRANSPORT_MAX_PATHS];
   socklen_t local_addrs_len[TRANSPORT_MAX_PATHS];
+  uint32_t local_ifindices[TRANSPORT_MAX_PATHS];
 
   /* client connection */
   struct sockaddr_storage remote_addrs[TRANSPORT_MAX_PATHS];
@@ -224,27 +247,70 @@ static fec_t *get_cached_fec(transport_t *t, fec_type_t type,
   return fec;
 }
 
+static bool sockaddr_endpoint_equal(const struct sockaddr *a,
+                                    const struct sockaddr *b) {
+  if (!a || !b || a->sa_family != b->sa_family)
+    return false;
+  if (a->sa_family == AF_INET) {
+    const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
+    const struct sockaddr_in *b4 = (const struct sockaddr_in *)b;
+    return a4->sin_port == b4->sin_port &&
+           a4->sin_addr.s_addr == b4->sin_addr.s_addr;
+  }
+  if (a->sa_family == AF_INET6) {
+    const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
+    const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
+    return a6->sin6_port == b6->sin6_port &&
+           a6->sin6_scope_id == b6->sin6_scope_id &&
+           memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(a6->sin6_addr)) == 0;
+  }
+  return false;
+}
+
+static bool sockaddr_address_equal(const struct sockaddr *a,
+                                   const struct sockaddr *b) {
+  if (!a || !b || a->sa_family != b->sa_family)
+    return false;
+  if (a->sa_family == AF_INET) {
+    return ((const struct sockaddr_in *)a)->sin_addr.s_addr ==
+           ((const struct sockaddr_in *)b)->sin_addr.s_addr;
+  }
+  if (a->sa_family == AF_INET6) {
+    const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
+    const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
+    return a6->sin6_scope_id == b6->sin6_scope_id &&
+           memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(a6->sin6_addr)) == 0;
+  }
+  return false;
+}
+
+static size_t find_path_index_by_addresses(quicly_conn_t *quic,
+                                           const struct sockaddr *local,
+                                           const struct sockaddr *remote) {
+  for (size_t p = 0; p < QUICLY_MAX_FLAT_PATHS; p++) {
+    quicly_path_stats_t stats;
+    if (quicly_get_path_stats(quic, p, &stats) == 0 &&
+        sockaddr_endpoint_equal(&stats.local.sa, local) &&
+        sockaddr_endpoint_equal(&stats.remote.sa, remote))
+      return p;
+  }
+  return SIZE_MAX;
+}
+
 /* Helper to map a link/socket index to the QUIC path index by matching local
- * IPs */
+ * endpoints. */
 static size_t find_path_index_by_link(quicly_conn_t *quic, transport_t *t,
                                       size_t link_idx) {
   if (link_idx >= t->num_fds)
     return 0;
 
-  struct sockaddr_in *link_loc =
-      (struct sockaddr_in *)&t->local_addrs[link_idx];
-  if (link_loc->sin_family != AF_INET)
-    return 0;
-
-  for (size_t p = 0; p < 8; p++) { /* 8 is the max paths limit */
+  for (size_t p = 0; p < QUICLY_MAX_FLAT_PATHS; p++) {
     quicly_path_stats_t stats;
-    if (quicly_get_path_stats(quic, p, &stats) == 0) {
-      struct sockaddr_in *path_loc = (struct sockaddr_in *)&stats.local;
-      if (path_loc->sin_family == AF_INET &&
-          path_loc->sin_addr.s_addr == link_loc->sin_addr.s_addr) {
-        return p;
-      }
-    }
+    if (quicly_get_path_stats(quic, p, &stats) == 0 &&
+        sockaddr_address_equal(
+            &stats.local.sa,
+            (const struct sockaddr *)&t->local_addrs[link_idx]))
+      return p;
   }
   return 0;
 }
@@ -270,17 +336,89 @@ struct transport_conn_t {
   /* incoming datagram assembler cache */
   frame_assembler_t assemblers[ASSEMBLER_CACHE_SIZE];
   size_t assembler_index;
-  uint32_t last_seen_object_id;
+  object_gap_state_t object_gaps[UINT8_MAX + 1U];
+  uint16_t queued_datagrams[QUICLY_MAX_FLAT_PATHS];
 };
+
+static void release_assembler(frame_assembler_t *a) {
+  if (!a)
+    return;
+  free(a->buffers);
+  free(a->buffer_storage);
+  free(a->received_mask);
+  free(a->missing_mask);
+  free(a->missing_indices);
+  memset(a, 0, sizeof(*a));
+}
+
+static bool grow_assembler(frame_assembler_t *a, uint16_t symbols,
+                           uint16_t symbol_size) {
+  if (!a || symbols == 0 || symbol_size == 0)
+    return false;
+  if (a->buffers && a->capacity_symbols >= symbols &&
+      a->capacity_symbol_size >= symbol_size)
+    return true;
+
+  uint16_t new_symbols =
+      a->capacity_symbols > symbols ? a->capacity_symbols : symbols;
+  uint16_t new_symbol_size = a->capacity_symbol_size > symbol_size
+                                 ? a->capacity_symbol_size
+                                 : symbol_size;
+  uint8_t **buffers = calloc(new_symbols, sizeof(*buffers));
+  uint8_t *storage = calloc(new_symbols, new_symbol_size);
+  bool *received = calloc(new_symbols, sizeof(*received));
+  bool *missing = calloc(new_symbols, sizeof(*missing));
+  uint16_t *indices = calloc(new_symbols, sizeof(*indices));
+  if (!buffers || !storage || !received || !missing || !indices) {
+    free(buffers);
+    free(storage);
+    free(received);
+    free(missing);
+    free(indices);
+    return false;
+  }
+  for (size_t i = 0; i < new_symbols; i++)
+    buffers[i] = storage + i * new_symbol_size;
+  if (a->buffers) {
+    for (size_t i = 0; i < a->total_symbols; i++) {
+      memcpy(buffers[i], a->buffers[i], a->symbol_size);
+      received[i] = a->received_mask[i];
+    }
+  }
+
+  free(a->buffers);
+  free(a->buffer_storage);
+  free(a->received_mask);
+  free(a->missing_mask);
+  free(a->missing_indices);
+  a->buffers = buffers;
+  a->buffer_storage = storage;
+  a->received_mask = received;
+  a->missing_mask = missing;
+  a->missing_indices = indices;
+  a->capacity_symbols = new_symbols;
+  a->capacity_symbol_size = new_symbol_size;
+  return true;
+}
+
+static bool queue_datagram(transport_conn_t *conn, size_t path_index,
+                           ptls_iovec_t datagram) {
+  quicly_path_stats_t path_stats;
+  if (!conn || !conn->quic || path_index >= QUICLY_MAX_FLAT_PATHS ||
+      quicly_get_path_stats(conn->quic, path_index, &path_stats) != 0 ||
+      conn->queued_datagrams[path_index] >= QUICLY_PATH_DATAGRAM_QUEUE_CAPACITY)
+    return false;
+  quicly_send_datagram_frames_path(conn->quic, path_index, &datagram, 1);
+  conn->queued_datagrams[path_index]++;
+  return true;
+}
 
 static int find_subscription_by_alias(const transport_conn_t *conn,
                                       uint8_t alias,
                                       moq_track_id_t *out_track) {
-  if (alias < 8) {
-    out_track->type = (moq_track_type_t)alias;
-    out_track->name[0] = '\0';
-    return 0;
-  }
+  if (!conn || !out_track)
+    return -1;
+  memset(out_track, 0, sizeof(*out_track));
   for (int i = 0; i < 32; i++) {
     if (conn->subscriptions[i].active &&
         conn->subscriptions[i].alias == alias) {
@@ -294,10 +432,8 @@ static int find_subscription_by_alias(const transport_conn_t *conn,
 static int find_alias_by_track(const transport_conn_t *conn,
                                const moq_track_id_t *track,
                                uint8_t *out_alias) {
-  if (track->name[0] == '\0') {
-    *out_alias = (uint8_t)track->type;
-    return 0;
-  }
+  if (!conn || !track || !out_alias)
+    return -1;
   for (int i = 0; i < 32; i++) {
     if (conn->subscriptions[i].active &&
         conn->subscriptions[i].track_id.type == track->type &&
@@ -315,7 +451,13 @@ static bool is_subscribed(const transport_conn_t *conn,
   return find_alias_by_track(conn, track, &dummy) == 0;
 }
 
-static void add_subscription(transport_conn_t *conn, moq_track_type_t type,
+static bool valid_track_type(uint8_t type) {
+  return type == MOQ_TRACK_VIDEO || type == MOQ_TRACK_AUDIO ||
+         type == MOQ_TRACK_INPUT || type == MOQ_TRACK_TEXT ||
+         type == MOQ_TRACK_DATA || type == MOQ_TRACK_TELEMETRY;
+}
+
+static bool add_subscription(transport_conn_t *conn, moq_track_type_t type,
                              uint8_t flags, const char *name, uint8_t alias) {
   for (int i = 0; i < 32; i++) {
     if (conn->subscriptions[i].active &&
@@ -323,7 +465,7 @@ static void add_subscription(transport_conn_t *conn, moq_track_type_t type,
         strcmp(conn->subscriptions[i].track_id.name, name) == 0) {
       conn->subscriptions[i].alias = alias;
       conn->subscriptions[i].track_id.flags = flags;
-      return;
+      return true;
     }
   }
   for (int i = 0; i < 32; i++) {
@@ -338,9 +480,10 @@ static void add_subscription(transport_conn_t *conn, moq_track_type_t type,
       conn->subscriptions[i].alias = alias;
       conn->subscriptions[i].active = true;
       conn->subscriptions[i].stream = NULL;
-      return;
+      return true;
     }
   }
+  return false;
 }
 
 static void remove_subscription(transport_conn_t *conn, moq_track_type_t type,
@@ -414,7 +557,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (input.len < 5)
         break;
 
-      if (t->is_server && !conn->authenticated) {
+      if (!conn->authenticated) {
         quicly_close(conn->quic, 0, "unauthorized");
         break;
       }
@@ -427,7 +570,13 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
         break;
 
       char name[64];
-      size_t copy_len = (name_len < 63) ? name_len : 63;
+      if (name_len > 63 || !valid_track_type(track_type) ||
+          (flags & ~(MOQ_TRACK_FLAG_RELIABLE | MOQ_TRACK_FLAG_FEC_ENABLED |
+                     MOQ_TRACK_FLAG_FEC_RATELESS)) != 0) {
+        quicly_close(conn->quic, 0, "protocol error: invalid track");
+        break;
+      }
+      size_t copy_len = name_len;
       memcpy(name, input.base + 5, copy_len);
       name[copy_len] = '\0';
 
@@ -440,8 +589,11 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
             conn->quic,
             "Subscription mapping: track '%s' (type %d) mapped to alias %d",
             name, track_type, alias);
-        add_subscription(conn, (moq_track_type_t)track_type, flags, name,
-                         alias);
+        if (!add_subscription(conn, (moq_track_type_t)track_type, flags, name,
+                              alias)) {
+          quicly_close(conn->quic, 0, "protocol error: too many tracks");
+          break;
+        }
       } else if (type == 0x02) {
         remove_subscription(conn, (moq_track_type_t)track_type, name);
       }
@@ -465,7 +617,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       memcpy(&payload_size, input.base + 1, 4);
       payload_size = be32toh(payload_size);
 
-      if (payload_size > 1048576) {
+      if (payload_size > TRANSPORT_MAX_RELIABLE_OBJECT_SIZE) {
         quicly_close(conn->quic, 0, "protocol error: payload too large");
         break;
       }
@@ -473,7 +625,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (input.len < 5 + payload_size)
         break;
 
-      if (t->is_server && !conn->authenticated) {
+      if (!conn->authenticated) {
         quicly_close(conn->quic, 0, "unauthorized");
         break;
       }
@@ -500,6 +652,11 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (input.len < 3 + (size_t)token_len)
         break;
 
+      if (!t->is_server) {
+        quicly_close(conn->quic, 0, "protocol error: unexpected auth request");
+        break;
+      }
+
       transport_event_t ev = {.type = TRANSPORT_EVENT_AUTH,
                               .conn = conn,
                               .auth = {.token = input.base + 3,
@@ -510,6 +667,11 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
     } else if (type == 0x05) {
       if (input.len < 2)
         break;
+
+      if (t->is_server) {
+        quicly_close(conn->quic, 0, "protocol error: unexpected auth response");
+        break;
+      }
 
       uint8_t status = input.base[1];
       if (status == 1) {
@@ -530,7 +692,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       memcpy(&payload_size, input.base + 2, 4);
       payload_size = be32toh(payload_size);
 
-      if (payload_size > 1048576) {
+      if (payload_size > TRANSPORT_MAX_RELIABLE_OBJECT_SIZE) {
         quicly_close(conn->quic, 0, "protocol error: payload too large");
         break;
       }
@@ -538,7 +700,7 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       if (input.len < 6 + (size_t)payload_size)
         break;
 
-      if (t->is_server && !conn->authenticated) {
+      if (!conn->authenticated) {
         quicly_close(conn->quic, 0, "unauthorized");
         break;
       }
@@ -573,17 +735,21 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
       object_id = be32toh(object_id);
       wire_missing_count = be16toh(wire_missing_count);
 
+      if (wire_missing_count > FEC_MAX_TOTAL_SYMBOLS) {
+        quicly_close(conn->quic, 0, "protocol error: invalid nack");
+        break;
+      }
+
       size_t nack_msg_len = 12 + (size_t)wire_missing_count * 2;
       if (input.len < nack_msg_len)
         break;
 
-      if (t->is_server && !conn->authenticated) {
+      if (!conn->authenticated) {
         quicly_close(conn->quic, 0, "unauthorized");
         break;
       }
 
-      uint16_t missing_count =
-          wire_missing_count > 256 ? 256 : wire_missing_count;
+      uint16_t missing_count = wire_missing_count;
 
       moq_track_id_t resolved_track;
       if (find_subscription_by_alias(conn, alias, &resolved_track) == 0) {
@@ -603,13 +769,17 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
         if (cached) {
           size_t data_symbols = cached->data_symbols;
           size_t parity_symbols = missing_count + 3;
+          if (data_symbols >= FEC_MAX_TOTAL_SYMBOLS)
+            parity_symbols = 0;
+          else if (parity_symbols > FEC_MAX_TOTAL_SYMBOLS - data_symbols)
+            parity_symbols = FEC_MAX_TOTAL_SYMBOLS - data_symbols;
           size_t total_symbols = data_symbols + parity_symbols;
           size_t symbol_size = cached->symbol_size;
 
           uint8_t **data_blocks = calloc(data_symbols, sizeof(uint8_t *));
           uint8_t **parity_blocks = calloc(parity_symbols, sizeof(uint8_t *));
 
-          if (data_blocks && parity_blocks) {
+          if (parity_symbols > 0 && data_blocks && parity_blocks) {
             bool alloc_failed = false;
             for (size_t i = 0; i < data_symbols; i++) {
               data_blocks[i] = calloc(1, symbol_size);
@@ -636,12 +806,13 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                   (total_symbols > 255) ? FEC_RAPTORQ : FEC_REED_SOLOMON;
               fec_t *fec = get_cached_fec(t, fec_type, data_symbols,
                                           parity_symbols, symbol_size);
+              bool encoded = false;
               if (fec) {
-                fec_encode(fec, (const uint8_t *const *)data_blocks,
-                           parity_blocks);
+                encoded = fec_encode(fec, (const uint8_t *const *)data_blocks,
+                                     parity_blocks);
               }
 
-              for (size_t i = 0; i < parity_symbols; i++) {
+              for (size_t i = 0; encoded && i < parity_symbols; i++) {
                 uint16_t s = data_symbols + i;
 
                 size_t pkt_len = sizeof(fec_packet_header_t) + symbol_size;
@@ -665,7 +836,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                        symbol_size);
 
                 ptls_iovec_t dgram = ptls_iovec_init(pkt_buf, pkt_len);
-                quicly_send_datagram_frames_path(conn->quic, 0, &dgram, 1);
+                if (!queue_datagram(conn, 0, dgram))
+                  break;
               }
             }
 
@@ -677,6 +849,9 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
               if (parity_blocks[i])
                 free(parity_blocks[i]);
             }
+            free(data_blocks);
+            free(parity_blocks);
+          } else {
             free(data_blocks);
             free(parity_blocks);
           }
@@ -752,10 +927,15 @@ static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
     memcpy(&payload_size, input.base, 4);
     payload_size = be32toh(payload_size);
 
+    if (payload_size > TRANSPORT_MAX_RELIABLE_OBJECT_SIZE) {
+      quicly_close(conn->quic, 0, "protocol error: payload too large");
+      break;
+    }
+
     if (input.len < 4 + (size_t)payload_size)
       break;
 
-    if (t->is_server && !conn->authenticated) {
+    if (!conn->authenticated) {
       quicly_close(conn->quic, 0, "unauthorized");
       break;
     }
@@ -843,6 +1023,27 @@ static quicly_error_t on_stream_open(quicly_stream_open_t *self,
   return 0;
 }
 
+static bool stream_write_frame(quicly_stream_t *stream, const void *header,
+                               size_t header_len, const void *payload,
+                               size_t payload_len) {
+  if (!stream || header_len > SIZE_MAX - payload_len ||
+      (payload_len > 0 && !payload))
+    return false;
+  size_t frame_len = header_len + payload_len;
+  uint8_t stack_buf[256];
+  uint8_t *frame =
+      frame_len <= sizeof(stack_buf) ? stack_buf : malloc(frame_len);
+  if (!frame)
+    return false;
+  memcpy(frame, header, header_len);
+  if (payload_len > 0)
+    memcpy(frame + header_len, payload, payload_len);
+  int ret = quicly_streambuf_egress_write(stream, frame, frame_len);
+  if (frame != stack_buf)
+    free(frame);
+  return ret == 0;
+}
+
 /* handle incoming datagram frames */
 static void send_nack(transport_conn_t *conn, uint8_t alias, uint32_t group_id,
                       uint32_t object_id, uint16_t *missing, uint16_t count) {
@@ -871,7 +1072,7 @@ static void send_nack(transport_conn_t *conn, uint8_t alias, uint32_t group_id,
     uint16_t idx = htobe16(missing[i]);
     memcpy(buf + 12 + i * 2, &idx, 2);
   }
-  quicly_streambuf_egress_write(conn->stream, buf, payload_len);
+  (void)stream_write_frame(conn->stream, buf, payload_len, NULL, 0);
 
   if (buf != static_buf) {
     free(buf);
@@ -887,7 +1088,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     return;
 
   transport_t *t = tconn->transport;
-  if (t->is_server && !tconn->authenticated)
+  if (!tconn->authenticated)
     return;
 
   if (payload.len < 1)
@@ -938,7 +1139,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   ptls_iovec_t reply_vec;
   reply_vec.base = (uint8_t *)&reply;
   reply_vec.len = sizeof(reply);
-  quicly_send_datagram_frames_path(conn, hdr->path_id, &reply_vec, 1);
+  (void)queue_datagram(tconn, hdr->path_id, reply_vec);
 
   uint8_t is_keyframe = hdr->is_keyframe;
   uint32_t group_id = be32toh(hdr->group_id);
@@ -949,11 +1150,14 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   uint16_t symbol_size = be16toh(hdr->symbol_size);
   uint32_t original_size = be32toh(hdr->original_size);
 
-  if (total_symbols > 16384 || symbol_size > 4096 ||
-      data_symbols > total_symbols)
+  if (total_symbols == 0 || total_symbols > FEC_MAX_TOTAL_SYMBOLS ||
+      symbol_size == 0 || symbol_size > FEC_MAX_SYMBOL_SIZE ||
+      data_symbols == 0 || data_symbols > total_symbols ||
+      symbol_index >= total_symbols)
     return;
 
-  if (original_size > (uint32_t)data_symbols * symbol_size ||
+  if (original_size > FEC_MAX_OBJECT_SIZE ||
+      original_size > (uint32_t)data_symbols * symbol_size ||
       original_size == 0)
     return;
 
@@ -961,16 +1165,34 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     return;
 
   if (resolved_track.type == MOQ_TRACK_DATA &&
-      object_id > tconn->last_seen_object_id + 1 &&
-      tconn->last_seen_object_id > 0) {
-    for (uint32_t missing_obj = tconn->last_seen_object_id + 1;
-         missing_obj < object_id; missing_obj++) {
-      uint16_t missing_idx = 0;
-      send_nack(tconn, track_id, group_id, missing_obj, &missing_idx, 1);
+      (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS)) {
+    object_gap_state_t *gap = &tconn->object_gaps[track_id];
+    if (object_id > gap->last_seen) {
+      if (gap->last_seen > 0 && object_id - gap->last_seen > 1) {
+        uint32_t first_missing = gap->last_seen + 1;
+        uint32_t missing_count = object_id - first_missing;
+        if (missing_count <= 32) {
+          if (gap->pending_mask == 0) {
+            gap->pending_base = first_missing;
+            gap->detected_at_ms = transport_get_time_ms();
+            gap->group_id = group_id;
+          }
+          if (first_missing >= gap->pending_base &&
+              first_missing - gap->pending_base < 32) {
+            uint32_t offset = first_missing - gap->pending_base;
+            uint32_t available = 32 - offset;
+            uint32_t count =
+                missing_count < available ? missing_count : available;
+            uint32_t bits = count == 32 ? UINT32_MAX : ((1U << count) - 1U);
+            gap->pending_mask |= bits << offset;
+          }
+        }
+      }
+      gap->last_seen = object_id;
+    } else if (gap->pending_mask != 0 && object_id >= gap->pending_base &&
+               object_id - gap->pending_base < 32) {
+      gap->pending_mask &= ~(1U << (object_id - gap->pending_base));
     }
-  }
-  if (object_id > tconn->last_seen_object_id) {
-    tconn->last_seen_object_id = object_id;
   }
 
   /* lookup active frame assembler cache */
@@ -1009,24 +1231,10 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
 
     if (!asm_slot->buffers || asm_slot->capacity_symbols < total_symbols ||
         asm_slot->capacity_symbol_size < symbol_size) {
-      if (asm_slot->buffers) {
-        for (size_t i = 0; i < asm_slot->capacity_symbols; i++) {
-          free(asm_slot->buffers[i]);
-        }
-        free(asm_slot->buffers);
-        free(asm_slot->received_mask);
-        free(asm_slot->missing_indices);
-      }
-
-      asm_slot->capacity_symbols = total_symbols > 256 ? total_symbols : 256;
-      asm_slot->capacity_symbol_size = symbol_size > 1250 ? symbol_size : 1250;
-      asm_slot->buffers = calloc(asm_slot->capacity_symbols, sizeof(uint8_t *));
-      asm_slot->received_mask =
-          calloc(asm_slot->capacity_symbols, sizeof(bool));
-      asm_slot->missing_indices =
-          calloc(asm_slot->capacity_symbols, sizeof(uint16_t));
-      for (size_t i = 0; i < asm_slot->capacity_symbols; i++) {
-        asm_slot->buffers[i] = calloc(1, asm_slot->capacity_symbol_size);
+      release_assembler(asm_slot);
+      if (!grow_assembler(asm_slot, total_symbols, symbol_size)) {
+        release_assembler(asm_slot);
+        return;
       }
     }
 
@@ -1043,20 +1251,26 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     asm_slot->decoded = false;
     asm_slot->received_count = 0;
     asm_slot->nack_sent = false;
+    asm_slot->first_symbol_time_ms = transport_get_time_ms();
+    asm_slot->last_activity_time_ms = asm_slot->first_symbol_time_ms;
   }
 
   if (asm_slot->decoded)
     return;
 
   if (total_symbols > asm_slot->total_symbols) {
-    if (total_symbols > asm_slot->capacity_symbols) {
+    if (!grow_assembler(asm_slot, total_symbols, symbol_size)) {
       return;
     }
     asm_slot->total_symbols = total_symbols;
   }
 
-  if (symbol_index >= asm_slot->capacity_symbols ||
-      symbol_index >= asm_slot->total_symbols)
+  total_symbols = asm_slot->total_symbols;
+  data_symbols = asm_slot->data_symbols;
+  symbol_size = asm_slot->symbol_size;
+  original_size = asm_slot->original_size;
+
+  if (symbol_index >= asm_slot->total_symbols)
     return;
 
   if (!asm_slot->received_mask[symbol_index]) {
@@ -1064,26 +1278,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
            payload.base + sizeof(fec_packet_header_t), symbol_size);
     asm_slot->received_mask[symbol_index] = true;
     asm_slot->received_count++;
-  }
-
-  int64_t now_nack_ms = transport_get_time_ms();
-  if (resolved_track.type == MOQ_TRACK_DATA &&
-      (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) &&
-      !asm_slot->decoded &&
-      (!asm_slot->nack_sent ||
-       (now_nack_ms - asm_slot->last_nack_time_ms) > 10)) {
-    uint16_t missing_count = 0;
-    for (uint16_t i = 0; i < asm_slot->total_symbols; i++) {
-      if (!asm_slot->received_mask[i]) {
-        asm_slot->missing_indices[missing_count++] = i;
-      }
-    }
-    if (missing_count > 0) {
-      send_nack(tconn, track_id, group_id, object_id, asm_slot->missing_indices,
-                missing_count);
-      asm_slot->nack_sent = true;
-      asm_slot->last_nack_time_ms = now_nack_ms;
-    }
+    asm_slot->last_activity_time_ms = transport_get_time_ms();
   }
 
   if (asm_slot->received_count >= data_symbols) {
@@ -1102,18 +1297,14 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
       size_t parity_symbols = total_symbols - data_symbols;
       if (parity_symbols > 0) {
         fec_type_t fec_type =
-            (resolved_track.type == MOQ_TRACK_DATA && total_symbols > 255)
-                ? FEC_RAPTORQ
-                : FEC_REED_SOLOMON;
+            total_symbols > 255 ? FEC_RAPTORQ : FEC_REED_SOLOMON;
         fec_t *fec = get_cached_fec(t, fec_type, data_symbols, parity_symbols,
                                     symbol_size);
         if (fec) {
-          bool missing[256];
-          memset(missing, 0, sizeof(missing));
           for (size_t i = 0; i < total_symbols; i++) {
-            missing[i] = !asm_slot->received_mask[i];
+            asm_slot->missing_mask[i] = !asm_slot->received_mask[i];
           }
-          success = fec_decode(fec, asm_slot->buffers, missing);
+          success = fec_decode(fec, asm_slot->buffers, asm_slot->missing_mask);
         }
       }
     }
@@ -1145,7 +1336,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
                                          .priority = asm_slot->priority}};
       t->callback(t->user_data, &ev);
       free(full_data);
-      asm_slot->decoded = true;
+      release_assembler(asm_slot);
     }
   }
 }
@@ -1175,7 +1366,11 @@ static int load_certificate_and_key(ptls_context_t *tlsctx,
     fprintf(stderr, "failed to load private key\n");
     return -1;
   }
-  ptls_openssl_init_sign_certificate(sign_cert, pkey);
+  if (ptls_openssl_init_sign_certificate(sign_cert, pkey) != 0) {
+    EVP_PKEY_free(pkey);
+    fprintf(stderr, "failed to initialize certificate signer\n");
+    return -1;
+  }
   EVP_PKEY_free(pkey);
   tlsctx->sign_certificate = &sign_cert->super;
   return 0;
@@ -1252,6 +1447,15 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
         break;
       }
     }
+  }
+
+  for (int i = 0; i < update->removed_count; i++) {
+    ifmon_pipe_msg_t msg = {0};
+    msg.index = update->removed[i];
+    msg.is_added = 0;
+    msg.addr.ss_family = AF_UNSPEC;
+    ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
+    (void)w;
   }
 
   for (int i = 0; i < update->modified_count; i++) {
@@ -1334,9 +1538,30 @@ static void configure_socket_buffers(int fd) {
 }
 
 transport_t *transport_create(const transport_config_t *config) {
+  if (!config || !config->callback || config->port == 0 ||
+      config->num_bind_hosts == 0 ||
+      config->num_bind_hosts > TRANSPORT_MAX_PATHS ||
+      config->num_remote_hosts > TRANSPORT_MAX_PATHS ||
+      config->simulated_loss_rate > 100 ||
+      (!config->verify_peer && !config->allow_insecure_peer))
+    return NULL;
+  for (size_t i = 0; i < config->num_bind_hosts; i++) {
+    if (!config->bind_hosts[i])
+      return NULL;
+  }
+  for (size_t i = 0; i < config->num_remote_hosts; i++) {
+    if (!config->remote_hosts[i])
+      return NULL;
+  }
+
   transport_t *t = calloc(1, sizeof(transport_t));
   if (!t)
     return NULL;
+
+  for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++)
+    t->fds[i] = -1;
+  t->ifmon_pipe[0] = -1;
+  t->ifmon_pipe[1] = -1;
 
   t->arena.capacity = 16 * 1024 * 1024;
   t->arena.buffer = malloc(t->arena.capacity);
@@ -1359,7 +1584,7 @@ transport_t *transport_create(const transport_config_t *config) {
           fcntl(t->ifmon_pipe[0], F_GETFL) | O_NONBLOCK);
     fcntl(t->ifmon_pipe[1], F_SETFL,
           fcntl(t->ifmon_pipe[1], F_GETFL) | O_NONBLOCK);
-    ifmon_watch_start(&t->ifmon_w, on_ifmon_update, t);
+    (void)ifmon_watch_start(&t->ifmon_w, on_ifmon_update, t);
   } else {
     t->ifmon_pipe[0] = -1;
     t->ifmon_pipe[1] = -1;
@@ -1406,14 +1631,20 @@ transport_t *transport_create(const transport_config_t *config) {
     if (strchr(config->bind_hosts[i], ':')) {
       struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&t->local_addrs[i];
       sin6->sin6_family = AF_INET6;
-      inet_pton(AF_INET6, config->bind_hosts[i], &sin6->sin6_addr);
+      if (inet_pton(AF_INET6, config->bind_hosts[i], &sin6->sin6_addr) != 1) {
+        transport_destroy(t);
+        return NULL;
+      }
       sin6->sin6_port = t->is_server ? htons(config->port) : 0;
       t->local_addrs_len[i] = sizeof(struct sockaddr_in6);
       t->fds[i] = socket(AF_INET6, SOCK_DGRAM, 0);
     } else {
       struct sockaddr_in *sin = (struct sockaddr_in *)&t->local_addrs[i];
       sin->sin_family = AF_INET;
-      inet_pton(AF_INET, config->bind_hosts[i], &sin->sin_addr);
+      if (inet_pton(AF_INET, config->bind_hosts[i], &sin->sin_addr) != 1) {
+        transport_destroy(t);
+        return NULL;
+      }
       sin->sin_port = t->is_server ? htons(config->port) : 0;
       t->local_addrs_len[i] = sizeof(struct sockaddr_in);
       t->fds[i] = socket(AF_INET, SOCK_DGRAM, 0);
@@ -1493,13 +1724,20 @@ transport_t *transport_create(const transport_config_t *config) {
         struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&t->remote_addrs[i];
         sin6->sin6_family = AF_INET6;
         sin6->sin6_port = htons(config->port);
-        inet_pton(AF_INET6, config->remote_hosts[i], &sin6->sin6_addr);
+        if (inet_pton(AF_INET6, config->remote_hosts[i], &sin6->sin6_addr) !=
+            1) {
+          transport_destroy(t);
+          return NULL;
+        }
         t->remote_addrs_len[i] = sizeof(struct sockaddr_in6);
       } else {
         struct sockaddr_in *sin = (struct sockaddr_in *)&t->remote_addrs[i];
         sin->sin_family = AF_INET;
         sin->sin_port = htons(config->port);
-        inet_pton(AF_INET, config->remote_hosts[i], &sin->sin_addr);
+        if (inet_pton(AF_INET, config->remote_hosts[i], &sin->sin_addr) != 1) {
+          transport_destroy(t);
+          return NULL;
+        }
         t->remote_addrs_len[i] = sizeof(struct sockaddr_in);
       }
     }
@@ -1525,7 +1763,11 @@ transport_t *transport_create(const transport_config_t *config) {
     *quicly_get_data(conn->quic) = conn;
     t->client_conn = conn;
 
-    quicly_open_stream(conn->quic, &conn->stream, 0);
+    if (quicly_open_stream(conn->quic, &conn->stream, 0) != 0 ||
+        !conn->stream) {
+      transport_destroy(t);
+      return NULL;
+    }
   }
 
   /* make socket nonblocking is handled in the loop */
@@ -1554,31 +1796,15 @@ void transport_destroy(transport_t *t) {
     for (size_t i = 0; i < t->conn_count; i++) {
       transport_conn_t *conn = t->conns[i];
       quicly_free(conn->quic);
-      for (size_t a = 0; a < ASSEMBLER_CACHE_SIZE; a++) {
-        if (conn->assemblers[a].buffers) {
-          for (size_t s = 0; s < conn->assemblers[a].capacity_symbols; s++) {
-            free(conn->assemblers[a].buffers[s]);
-          }
-          free(conn->assemblers[a].buffers);
-          free(conn->assemblers[a].received_mask);
-          free(conn->assemblers[a].missing_indices);
-        }
-      }
+      for (size_t a = 0; a < ASSEMBLER_CACHE_SIZE; a++)
+        release_assembler(&conn->assemblers[a]);
       free(conn);
     }
   } else if (t->client_conn) {
     transport_conn_t *conn = t->client_conn;
     quicly_free(conn->quic);
-    for (size_t a = 0; a < ASSEMBLER_CACHE_SIZE; a++) {
-      if (conn->assemblers[a].buffers) {
-        for (size_t s = 0; s < conn->assemblers[a].capacity_symbols; s++) {
-          free(conn->assemblers[a].buffers[s]);
-        }
-        free(conn->assemblers[a].buffers);
-        free(conn->assemblers[a].received_mask);
-        free(conn->assemblers[a].missing_indices);
-      }
-    }
+    for (size_t a = 0; a < ASSEMBLER_CACHE_SIZE; a++)
+      release_assembler(&conn->assemblers[a]);
     free(conn);
   }
 
@@ -1613,10 +1839,17 @@ void transport_destroy(transport_t *t) {
     ptls_openssl_dispose_verify_certificate(&t->verifier);
   }
 
+  if (t->tls_ctx.sign_certificate) {
+    ptls_openssl_dispose_sign_certificate(&t->sign_cert);
+  }
+  for (size_t i = 0; i < t->tls_ctx.certificates.count; i++)
+    free(t->tls_ctx.certificates.list[i].base);
+  free(t->tls_ctx.certificates.list);
+
   free(t);
 }
 
-static void flush_fec_buffer(transport_t *t);
+static bool flush_fec_buffer(transport_t *t);
 
 void transport_tick(transport_t *t) {
   if (!t)
@@ -1624,17 +1857,57 @@ void transport_tick(transport_t *t) {
 
   /* Sweep active assemblers for 10ms NACK retries */
   int64_t now_nack_ms = transport_get_time_ms();
+  size_t object_nack_budget = 32;
   size_t active_conns = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
   for (size_t c = 0; c < active_conns; c++) {
     transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
     if (!conn || !conn->quic ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
+
+    for (size_t alias = 0; alias <= UINT8_MAX && object_nack_budget > 0;
+         alias++) {
+      object_gap_state_t *gap = &conn->object_gaps[alias];
+      if (gap->pending_mask == 0 ||
+          now_nack_ms - gap->detected_at_ms < FEC_NACK_DELAY_MS)
+        continue;
+      for (uint32_t bit = 0; bit < 32 && object_nack_budget > 0; bit++) {
+        if ((gap->pending_mask & (1U << bit)) == 0)
+          continue;
+        uint16_t missing_idx = 0;
+        send_nack(conn, (uint8_t)alias, gap->group_id, gap->pending_base + bit,
+                  &missing_idx, 1);
+        gap->pending_mask &= ~(1U << bit);
+        object_nack_budget--;
+      }
+    }
+
     for (size_t i = 0; i < ASSEMBLER_CACHE_SIZE; i++) {
       frame_assembler_t *asm_slot = &conn->assemblers[i];
-      if (asm_slot->total_symbols > 0 && !asm_slot->decoded &&
+      if (asm_slot->total_symbols == 0)
+        continue;
+
+      if (now_nack_ms - asm_slot->last_activity_time_ms >=
+          FEC_ASSEMBLER_TIMEOUT_MS) {
+        moq_track_id_t resolved_track;
+        if (find_subscription_by_alias(conn, asm_slot->track_id,
+                                       &resolved_track) == 0) {
+          transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
+                                  .conn = conn,
+                                  .track_id = resolved_track,
+                                  .object = {.track_id = resolved_track,
+                                             .group_id = asm_slot->group_id,
+                                             .object_id = asm_slot->object_id}};
+          t->callback(t->user_data, &ev);
+        }
+        release_assembler(asm_slot);
+        continue;
+      }
+
+      if (!asm_slot->decoded &&
+          now_nack_ms - asm_slot->first_symbol_time_ms >= FEC_NACK_DELAY_MS &&
           (!asm_slot->nack_sent ||
-           (now_nack_ms - asm_slot->last_nack_time_ms) > 10)) {
+           now_nack_ms - asm_slot->last_nack_time_ms >= FEC_NACK_DELAY_MS)) {
         moq_track_id_t resolved_track;
         if (find_subscription_by_alias(conn, asm_slot->track_id,
                                        &resolved_track) == 0) {
@@ -1662,7 +1935,7 @@ void transport_tick(transport_t *t) {
   if (t->fec_buf_len > 0) {
     uint64_t now = ptls_get_time.cb(&ptls_get_time);
     if ((now - t->fec_first_pkt_time) >= 3) {
-      flush_fec_buffer(t);
+      (void)flush_fec_buffer(t);
     }
   }
 
@@ -1741,6 +2014,7 @@ void transport_tick(transport_t *t) {
               t->fds[t->num_fds] = fd;
               t->local_addrs[t->num_fds] = msg.addr;
               t->local_addrs_len[t->num_fds] = msg.addr_len;
+              t->local_ifindices[t->num_fds] = msg.index;
               t->num_fds++;
 
               char ip_str[64];
@@ -1783,8 +2057,10 @@ void transport_tick(transport_t *t) {
       } else {
         /* ip removed */
         for (size_t i = 0; i < t->num_fds; i++) {
-          if (t->local_addrs[i].ss_family == msg.addr.ss_family) {
-            int match = 0;
+          int match = msg.addr.ss_family == AF_UNSPEC
+                          ? t->local_ifindices[i] == msg.index
+                          : 0;
+          if (!match && t->local_addrs[i].ss_family == msg.addr.ss_family) {
             if (msg.addr.ss_family == AF_INET) {
               struct sockaddr_in *s1 = (struct sockaddr_in *)&t->local_addrs[i];
               struct sockaddr_in *s2 = (struct sockaddr_in *)&msg.addr;
@@ -1798,18 +2074,19 @@ void transport_tick(transport_t *t) {
                          sizeof(struct in6_addr)) == 0)
                 match = 1;
             }
-            if (match) {
-              CLOSE_SOCKET(t->fds[i]);
-              /* remove from array */
-              for (size_t j = i; j < t->num_fds - 1; j++) {
-                t->fds[j] = t->fds[j + 1];
-                t->local_addrs[j] = t->local_addrs[j + 1];
-                t->local_addrs_len[j] = t->local_addrs_len[j + 1];
-              }
-              t->num_fds--;
-              fprintf(stderr, "ifmon: removed socket for local IP\n");
-              break;
+          }
+          if (match) {
+            CLOSE_SOCKET(t->fds[i]);
+            /* remove from array */
+            for (size_t j = i; j < t->num_fds - 1; j++) {
+              t->fds[j] = t->fds[j + 1];
+              t->local_addrs[j] = t->local_addrs[j + 1];
+              t->local_addrs_len[j] = t->local_addrs_len[j + 1];
+              t->local_ifindices[j] = t->local_ifindices[j + 1];
             }
+            t->num_fds--;
+            fprintf(stderr, "ifmon: removed socket for local IP\n");
+            break;
           }
         }
       }
@@ -1858,6 +2135,10 @@ void transport_tick(transport_t *t) {
                               &decoded, NULL, &t->next_cid, NULL, NULL);
             if (accept_res == 0 && new_quic) {
               target = calloc(1, sizeof(transport_conn_t));
+              if (!target) {
+                quicly_free(new_quic);
+                continue;
+              }
               target->transport = t;
               target->quic = new_quic;
               *quicly_get_data(new_quic) = target;
@@ -1969,8 +2250,16 @@ void transport_tick(transport_t *t) {
       int send_res = quicly_send(conn->quic, &dest, &src, dgrams, &num_dgrams,
                                  dgrams_buf, sizeof(dgrams_buf));
       if (send_res == 0) {
-        if (num_dgrams == 0)
+        if (num_dgrams == 0) {
+          if (!quicly_has_datagram_frames(conn->quic))
+            memset(conn->queued_datagrams, 0, sizeof(conn->queued_datagrams));
           break;
+        }
+
+        size_t sent_path =
+            find_path_index_by_addresses(conn->quic, &src.sa, &dest.sa);
+        if (sent_path < QUICLY_MAX_FLAT_PATHS)
+          conn->queued_datagrams[sent_path] = 0;
 
         int out_fd = t->fds[0];
         if (src.sa.sa_family == AF_INET) {
@@ -2126,16 +2415,8 @@ void transport_tick(transport_t *t) {
         t->callback(t->user_data, &ev);
 
         quicly_free(conn->quic);
-        for (size_t a = 0; a < ASSEMBLER_CACHE_SIZE; a++) {
-          if (conn->assemblers[a].buffers) {
-            for (size_t s = 0; s < conn->assemblers[a].capacity_symbols; s++) {
-              free(conn->assemblers[a].buffers[s]);
-            }
-            free(conn->assemblers[a].buffers);
-            free(conn->assemblers[a].received_mask);
-            free(conn->assemblers[a].missing_indices);
-          }
-        }
+        for (size_t a = 0; a < ASSEMBLER_CACHE_SIZE; a++)
+          release_assembler(&conn->assemblers[a]);
         free(conn);
 
         if (t->is_server) {
@@ -2150,6 +2431,7 @@ void transport_tick(transport_t *t) {
         }
         break;
       } else {
+        quicly_close(conn->quic, send_res, "send failure");
         break;
       }
     }
@@ -2171,29 +2453,63 @@ static track_delivery_profile_t get_track_profile(const moq_track_id_t *track) {
   return profile;
 }
 
-static void flush_fec_buffer(transport_t *t) {
+static bool track_id_is_valid(const moq_track_id_t *track) {
+  if (!track ||
+      strnlen(track->name, sizeof(track->name)) == sizeof(track->name))
+    return false;
+  if (!valid_track_type((uint8_t)track->type))
+    return false;
+  const uint8_t valid_flags = MOQ_TRACK_FLAG_RELIABLE |
+                              MOQ_TRACK_FLAG_FEC_ENABLED |
+                              MOQ_TRACK_FLAG_FEC_RATELESS;
+  return (track->flags & ~valid_flags) == 0;
+}
+
+static bool track_id_equal(const moq_track_id_t *a, const moq_track_id_t *b) {
+  return a->type == b->type && a->flags == b->flags &&
+         strcmp(a->name, b->name) == 0;
+}
+
+static size_t select_physical_path(const path_t *paths, size_t num_paths,
+                                   size_t symbol_index) {
+  size_t accumulated = 0;
+  for (size_t i = 0; i < num_paths; i++) {
+    accumulated += paths[i].x;
+    if (symbol_index < accumulated)
+      return i;
+  }
+  return 0;
+}
+
+static bool flush_fec_buffer(transport_t *t) {
   if (t->fec_buf_len == 0)
-    return;
+    return true;
 
   moq_object_t obj = {.track_id = t->fec_track_id,
                       .group_id = 0,
-                      .object_id = t->fec_object_id++,
+                      .object_id = t->fec_object_id,
                       .data = t->fec_buf,
                       .size = t->fec_buf_len,
                       .is_keyframe = false,
                       .priority = t->fec_priority};
 
   t->fec_in_flush = true;
-  transport_publish(t, &obj);
+  bool published = transport_publish(t, &obj);
   t->fec_in_flush = false;
 
+  if (!published)
+    return false;
+
+  t->fec_object_id++;
   t->fec_buf_len = 0;
   t->fec_first_pkt_time = 0;
   t->fec_pkt_count = 0;
+  return true;
 }
 
 bool transport_publish(transport_t *t, const moq_object_t *obj) {
-  if (!t)
+  if (!t || !obj || !track_id_is_valid(&obj->track_id) ||
+      (obj->size > 0 && !obj->data))
     return false;
 
   /* route to grouping buffer if it's data and we're not flushing */
@@ -2239,6 +2555,23 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
     }
 
     if (use_fec) {
+      if (obj->size > TRANSPORT_MAX_FEC_RECORD_SIZE)
+        return false;
+
+      if (t->fec_buf_len > 0 &&
+          (!track_id_equal(&t->fec_track_id, &obj->track_id) ||
+           t->fec_priority != obj->priority)) {
+        if (!flush_fec_buffer(t))
+          return false;
+      }
+
+      if (t->fec_buf_len > 0 &&
+          (t->fec_pkt_count >= 4 || obj->size > 16384 - 2 ||
+           t->fec_buf_len > 16384 - 2 - obj->size)) {
+        if (!flush_fec_buffer(t))
+          return false;
+      }
+
       uint64_t now = ptls_get_time.cb(&ptls_get_time);
       if (t->fec_buf_len == 0) {
         t->fec_first_pkt_time = now;
@@ -2246,11 +2579,18 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
         t->fec_priority = obj->priority;
       }
 
+      if (obj->size > SIZE_MAX - 2 - t->fec_buf_len)
+        return false;
       size_t needed = t->fec_buf_len + 2 + obj->size;
       if (needed > t->fec_buf_cap) {
         size_t new_cap = t->fec_buf_cap == 0 ? 4096 : t->fec_buf_cap * 2;
-        while (new_cap < needed)
+        if (new_cap < t->fec_buf_cap)
+          return false;
+        while (new_cap < needed) {
+          if (new_cap > SIZE_MAX / 2)
+            return false;
           new_cap *= 2;
+        }
         uint8_t *new_buf = realloc(t->fec_buf, new_cap);
         if (!new_buf) {
           return false;
@@ -2265,9 +2605,8 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
       t->fec_buf_len = needed;
       t->fec_pkt_count++;
 
-      if (t->fec_pkt_count >= 4 || t->fec_buf_len >= 16384) {
-        flush_fec_buffer(t);
-      }
+      if (t->fec_pkt_count >= 4 || t->fec_buf_len >= 16384)
+        return flush_fec_buffer(t);
       return true;
     }
   }
@@ -2276,6 +2615,8 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
 
   /* route over reliable stream if requested by profile */
   if (profile.reliable) {
+    if (obj->size > TRANSPORT_MAX_RELIABLE_OBJECT_SIZE)
+      return false;
     size_t active_count =
         t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
     for (size_t i = 0; i < active_count; ++i) {
@@ -2310,7 +2651,11 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
                                 " for MoQ track alias %d",
                                 sub->stream->stream_id, sub->alias);
             uint8_t alias = sub->alias;
-            quicly_streambuf_egress_write(sub->stream, &alias, 1);
+            if (!stream_write_frame(sub->stream, &alias, 1, NULL, 0)) {
+              quicly_reset_stream(sub->stream, 1);
+              sub->stream = NULL;
+              return false;
+            }
           } else {
             fprintf(stderr, "Failed to open reliable track stream: %d\n", err);
             continue;
@@ -2318,10 +2663,12 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
         }
 
         uint32_t sz = htobe32((uint32_t)obj->size);
-        quicly_streambuf_egress_write(sub->stream, &sz, sizeof(sz));
-        quicly_streambuf_egress_write(sub->stream, obj->data, obj->size);
+        if (!stream_write_frame(sub->stream, &sz, sizeof(sz), obj->data,
+                                obj->size))
+          return false;
       } else {
-        transport_send_unicast(t, conn, obj->data, obj->size);
+        if (!transport_send_unicast(t, conn, obj->data, obj->size))
+          return false;
       }
     }
     return true;
@@ -2329,6 +2676,8 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
 
   /* audio, video, text tracks go over unreliable datagram frames with FEC */
   size_t data_size = obj->size;
+  if (data_size == 0 || data_size > FEC_MAX_OBJECT_SIZE)
+    return false;
   size_t symbol_size = 1100;
   if (t->quic_ctx.initial_egress_max_udp_payload_size > 80) {
     symbol_size = t->quic_ctx.initial_egress_max_udp_payload_size - 80;
@@ -2408,6 +2757,8 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
     if (!pathflow_ctx) {
       pathflow_ctx = calloc(1, sizeof(pathflow_context_t));
     }
+    if (!pathflow_ctx)
+      return false;
     pathflow_ctx->offset = 0;
 
     pathflow_optimize(pathflow_ctx, t->num_fds, data_symbols, paths_array,
@@ -2468,6 +2819,10 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
       arena_alloc(&t->arena, data_symbols * sizeof(uint8_t *));
   uint8_t **parity_blocks =
       arena_alloc(&t->arena, parity_symbols * sizeof(uint8_t *));
+  if (!data_blocks || (parity_symbols > 0 && !parity_blocks)) {
+    arena_reset(&t->arena);
+    return false;
+  }
 
   for (size_t i = 0; i < data_symbols; i++) {
     size_t offset = i * symbol_size;
@@ -2478,6 +2833,10 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
     } else {
       /* Allocate and zero-pad the final symbol block */
       data_blocks[i] = arena_alloc(&t->arena, symbol_size);
+      if (!data_blocks[i]) {
+        arena_reset(&t->arena);
+        return false;
+      }
       if (chunk > 0) {
         memcpy(data_blocks[i], (uint8_t *)obj->data + offset, chunk);
       }
@@ -2486,21 +2845,64 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
 
   for (size_t i = 0; i < parity_symbols; i++) {
     parity_blocks[i] = arena_alloc(&t->arena, symbol_size);
-  }
-
-  if (parity_symbols > 0) {
-    if (fec_type == FEC_RAPTORQ && (data_symbols + parity_symbols) <= 255) {
-      fec_type = FEC_REED_SOLOMON;
-    }
-    fec_t *fec =
-        get_cached_fec(t, fec_type, data_symbols, parity_symbols, symbol_size);
-    if (fec) {
-      fec_encode(fec, (const uint8_t *const *)data_blocks, parity_blocks);
+    if (!parity_blocks[i]) {
+      arena_reset(&t->arena);
+      return false;
     }
   }
 
   size_t total_symbols = data_symbols + parity_symbols;
+  if (total_symbols > FEC_MAX_TOTAL_SYMBOLS || total_symbols > UINT16_MAX) {
+    arena_reset(&t->arena);
+    return false;
+  }
+
+  if (parity_symbols > 0) {
+    if (total_symbols > 255) {
+      fec_type = FEC_RAPTORQ;
+    } else if (fec_type == FEC_RAPTORQ) {
+      fec_type = FEC_REED_SOLOMON;
+    }
+    fec_t *fec =
+        get_cached_fec(t, fec_type, data_symbols, parity_symbols, symbol_size);
+    if (!fec) {
+      arena_reset(&t->arena);
+      return false;
+    }
+    if (!fec_encode(fec, (const uint8_t *const *)data_blocks, parity_blocks)) {
+      arena_reset(&t->arena);
+      return false;
+    }
+  }
+
   size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+
+  /* Preflight every destination so publication is atomic with respect to the
+   * bounded Quicly per-path datagram queues. */
+  for (size_t c = 0; c < active_count; c++) {
+    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
+    if (!conn || !conn->quic ||
+        quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING ||
+        (t->is_server && !is_subscribed(conn, &obj->track_id)))
+      continue;
+    uint8_t alias;
+    if (find_alias_by_track(conn, &obj->track_id, &alias) != 0)
+      continue;
+    uint16_t needed[QUICLY_MAX_FLAT_PATHS] = {0};
+    for (size_t s = 0; s < total_symbols; s++) {
+      size_t physical = select_physical_path(paths_array, t->num_fds, s);
+      size_t mapped = find_path_index_by_link(conn->quic, t, physical);
+      if (mapped >= QUICLY_MAX_FLAT_PATHS ||
+          ++needed[mapped] > QUICLY_PATH_DATAGRAM_QUEUE_CAPACITY ||
+          conn->queued_datagrams[mapped] >
+              QUICLY_PATH_DATAGRAM_QUEUE_CAPACITY - needed[mapped]) {
+        arena_reset(&t->arena);
+        return false;
+      }
+    }
+  }
+
+  bool sent_to_peer = false;
   for (size_t c = 0; c < active_count; c++) {
     transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
     if (!conn || !conn->quic ||
@@ -2511,20 +2913,17 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
     uint8_t alias;
     if (find_alias_by_track(conn, &obj->track_id, &alias) != 0)
       continue;
+    sent_to_peer = true;
     for (size_t s = 0; s < total_symbols; s++) {
       size_t pkt_len = sizeof(fec_packet_header_t) + symbol_size;
       uint8_t *pkt_buf = arena_alloc(&t->arena, pkt_len);
+      if (!pkt_buf) {
+        arena_reset(&t->arena);
+        return false;
+      }
       fec_packet_header_t *hdr = (fec_packet_header_t *)pkt_buf;
 
-      size_t path_idx = 0;
-      size_t accumulated = 0;
-      for (size_t i = 0; i < t->num_fds; i++) {
-        accumulated += paths_array[i].x;
-        if (s < accumulated) {
-          path_idx = i;
-          break;
-        }
-      }
+      size_t path_idx = select_physical_path(paths_array, t->num_fds, s);
 
       hdr->track_id = alias;
       hdr->is_keyframe = obj->is_keyframe ? 1 : 0;
@@ -2549,11 +2948,14 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
       }
 
       ptls_iovec_t dgram = ptls_iovec_init(pkt_buf, pkt_len);
-      quicly_send_datagram_frames_path(conn->quic, mapped_path_idx, &dgram, 1);
+      if (!queue_datagram(conn, mapped_path_idx, dgram)) {
+        arena_reset(&t->arena);
+        return false;
+      }
     }
   }
 
-  if (obj->track_id.type == MOQ_TRACK_DATA) {
+  if (sent_to_peer && obj->track_id.type == MOQ_TRACK_DATA) {
     sent_object_cache_t *slot = &t->sent_cache[t->sent_cache_index];
     if (slot->data) {
       free(slot->data);
@@ -2580,13 +2982,13 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
 }
 
 bool transport_subscribe(transport_t *t, moq_track_id_t track_id) {
-  if (!t)
+  if (!t || !track_id_is_valid(&track_id))
     return false;
 
   if (t->is_server) {
     for (size_t i = 0; i < t->conn_count; i++) {
       transport_conn_t *conn = t->conns[i];
-      if (!conn || !conn->stream ||
+      if (!conn || !conn->authenticated || !conn->stream ||
           !quicly_sendstate_is_open(&conn->stream->sendstate))
         continue;
 
@@ -2604,22 +3006,23 @@ bool transport_subscribe(transport_t *t, moq_track_id_t track_id) {
           }
           alias = (uint8_t)next_alias;
         }
-        add_subscription(conn, track_id.type, track_id.flags, track_id.name,
-                         alias);
+        if (!add_subscription(conn, track_id.type, track_id.flags,
+                              track_id.name, alias))
+          return false;
       }
 
       uint8_t name_len = (uint8_t)strlen(track_id.name);
       uint8_t msg_hdr[5] = {0x01, alias, (uint8_t)track_id.type, track_id.flags,
                             name_len};
-      quicly_streambuf_egress_write(conn->stream, msg_hdr, 5);
-      if (name_len > 0) {
-        quicly_streambuf_egress_write(conn->stream, track_id.name, name_len);
-      }
+      if (!stream_write_frame(conn->stream, msg_hdr, sizeof(msg_hdr),
+                              track_id.name, name_len))
+        return false;
     }
     return true;
   }
 
-  if (!t->client_conn || !t->client_conn->stream ||
+  if (!t->client_conn || !t->client_conn->authenticated ||
+      !t->client_conn->stream ||
       !quicly_sendstate_is_open(&t->client_conn->stream->sendstate)) {
     return false;
   }
@@ -2638,40 +3041,34 @@ bool transport_subscribe(transport_t *t, moq_track_id_t track_id) {
       }
       alias = (uint8_t)next_alias;
     }
-    add_subscription(t->client_conn, track_id.type, track_id.flags,
-                     track_id.name, alias);
+    if (!add_subscription(t->client_conn, track_id.type, track_id.flags,
+                          track_id.name, alias))
+      return false;
   }
 
   uint8_t name_len = (uint8_t)strlen(track_id.name);
   uint8_t msg_hdr[5] = {0x01, alias, (uint8_t)track_id.type, track_id.flags,
                         name_len};
-  quicly_streambuf_egress_write(t->client_conn->stream, msg_hdr, 5);
-  if (name_len > 0) {
-    quicly_streambuf_egress_write(t->client_conn->stream, track_id.name,
-                                  name_len);
-  }
-  return true;
+  return stream_write_frame(t->client_conn->stream, msg_hdr, sizeof(msg_hdr),
+                            track_id.name, name_len);
 }
 
 bool transport_request_keyframe(transport_t *t, moq_track_id_t track_id) {
-  if (!t || t->is_server || !t->client_conn || !t->client_conn->stream ||
+  if (!t || !track_id_is_valid(&track_id) || t->is_server || !t->client_conn ||
+      !t->client_conn->authenticated || !t->client_conn->stream ||
       !quicly_sendstate_is_open(&t->client_conn->stream->sendstate))
     return false;
 
   uint8_t name_len = (uint8_t)strlen(track_id.name);
   uint8_t msg_hdr[5] = {0x06, 0, (uint8_t)track_id.type, track_id.flags,
                         name_len};
-  quicly_streambuf_egress_write(t->client_conn->stream, msg_hdr, 5);
-  if (name_len > 0) {
-    quicly_streambuf_egress_write(t->client_conn->stream, track_id.name,
-                                  name_len);
-  }
-  return true;
+  return stream_write_frame(t->client_conn->stream, msg_hdr, sizeof(msg_hdr),
+                            track_id.name, name_len);
 }
 
 bool transport_send_unicast(transport_t *t, transport_conn_t *conn,
                             const void *data, size_t size) {
-  if (!t)
+  if (!t || size > TRANSPORT_MAX_RELIABLE_OBJECT_SIZE || (size > 0 && !data))
     return false;
   if (!conn || !conn->stream ||
       !quicly_sendstate_is_open(&conn->stream->sendstate))
@@ -2682,9 +3079,7 @@ bool transport_send_unicast(transport_t *t, transport_conn_t *conn,
   uint32_t sz = htobe32((uint32_t)size);
   memcpy(hdr + 1, &sz, 4);
 
-  quicly_streambuf_egress_write(conn->stream, hdr, 5);
-  quicly_streambuf_egress_write(conn->stream, data, size);
-  return true;
+  return stream_write_frame(conn->stream, hdr, sizeof(hdr), data, size);
 }
 
 void transport_close_conn(transport_t *t, transport_conn_t *conn) {
@@ -2702,7 +3097,7 @@ bool transport_send_auth(transport_t *t, transport_conn_t *conn,
   if (!conn || !conn->stream ||
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
-  if (token_len > 65535)
+  if (token_len > 65535 || (token_len > 0 && !token))
     return false;
 
   uint8_t hdr[3];
@@ -2710,11 +3105,7 @@ bool transport_send_auth(transport_t *t, transport_conn_t *conn,
   uint16_t t_len = htobe16((uint16_t)token_len);
   memcpy(hdr + 1, &t_len, 2);
 
-  quicly_streambuf_egress_write(conn->stream, hdr, 3);
-  if (token_len > 0) {
-    quicly_streambuf_egress_write(conn->stream, token, token_len);
-  }
-  return true;
+  return stream_write_frame(conn->stream, hdr, sizeof(hdr), token, token_len);
 }
 
 bool transport_respond_auth(transport_t *t, transport_conn_t *conn,
@@ -2726,7 +3117,8 @@ bool transport_respond_auth(transport_t *t, transport_conn_t *conn,
     return false;
 
   uint8_t resp[2] = {0x05, success ? 1 : 0};
-  quicly_streambuf_egress_write(conn->stream, resp, 2);
+  if (!stream_write_frame(conn->stream, resp, sizeof(resp), NULL, 0))
+    return false;
 
   if (success) {
     conn->authenticated = true;
@@ -2789,25 +3181,6 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
   transport_conn_t *target =
       t->is_server ? (t->conn_count > 0 ? t->conns[0] : NULL) : t->client_conn;
   if (target && target->quic) {
-    if (path_idx == 0) {
-      fprintf(stderr, "=== %s Connection Paths ===\n",
-              t->is_server ? "SERVER" : "CLIENT");
-      for (size_t p = 0; p < 8; p++) {
-        quicly_path_stats_t path_stats;
-        if (quicly_get_path_stats(target->quic, p, &path_stats) == 0) {
-          char local_ip[64] = {0}, remote_ip[64] = {0};
-          if (path_stats.local.sa.sa_family == AF_INET) {
-            inet_ntop(AF_INET, &path_stats.local.sin.sin_addr, local_ip,
-                      sizeof(local_ip));
-            inet_ntop(AF_INET, &path_stats.remote.sin.sin_addr, remote_ip,
-                      sizeof(remote_ip));
-          }
-          fprintf(stderr, "  path %zu: local=%s remote=%s sent=%lu lost=%lu\n",
-                  p, local_ip, remote_ip, (unsigned long)path_stats.sent,
-                  (unsigned long)path_stats.lost);
-        }
-      }
-    }
     quicly_path_stats_t path_stats;
     size_t mapped_path_idx = find_path_index_by_link(target->quic, t, path_idx);
     if (quicly_get_path_stats(target->quic, mapped_path_idx, &path_stats) ==
@@ -2844,7 +3217,7 @@ void transport_mock_iface_add(transport_t *t, const char *ip_addr) {
 }
 
 bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
-  if (!t)
+  if (!t || !track_id_is_valid(track_id))
     return false;
 
   track_delivery_profile_t profile = get_track_profile(track_id);
@@ -2859,6 +3232,9 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
     if (!conn || !conn->quic ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
+
+    if (!conn->authenticated)
+      return false;
 
     if (t->is_server && !is_subscribed(conn, track_id))
       continue;
@@ -2882,6 +3258,15 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
         }
       }
     } else {
+      for (size_t p = 0; p < QUICLY_MAX_FLAT_PATHS; p++) {
+        if (conn->queued_datagrams[p] >=
+            QUICLY_PATH_DATAGRAM_QUEUE_CAPACITY * 3 / 4) {
+          all_ready = false;
+          break;
+        }
+      }
+      if (!all_ready)
+        break;
       quicly_path_stats_t pstats;
       if (quicly_get_path_stats(conn->quic, 0, &pstats) == 0) {
         if (pstats.bytes_in_flight >= pstats.cwnd * 2) {

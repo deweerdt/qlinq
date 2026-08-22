@@ -12,6 +12,7 @@
 #else
 #include <netinet/in.h>
 #include <pthread.h>
+#include <stdatomic.h>
 #endif
 
 #ifdef __cplusplus
@@ -95,7 +96,7 @@ typedef struct ifmon_watcher {
   pthread_t thread;
   int stop_pipe[2];
   int event_fd;
-  volatile int running;
+  atomic_int running;
 #else
   HANDLE notify_handle;
   CRITICAL_SECTION lock;

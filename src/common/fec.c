@@ -2,6 +2,7 @@
 
 #include "fec.h"
 #include "rs.h"
+#include <limits.h>
 #include <nanorq_core.h>
 #include <nanorq_ops.h>
 #include <pthread.h>
@@ -20,8 +21,6 @@ struct fec_t {
 
   /* raptorq preallocated buffers for thread-safety and zero-allocation hot path
    */
-  uint8_t *rq_src_data;
-  uint8_t *rq_repair_out;
   uint8_t *rq_prep_mem;
   uint8_t *rq_work_mem;
   sched_op *rq_ops;
@@ -32,6 +31,16 @@ struct fec_t {
 
 fec_t *fec_create_ex(fec_type_t type, size_t data_symbols,
                      size_t parity_symbols, size_t symbol_size) {
+  if ((type != FEC_REED_SOLOMON && type != FEC_RAPTORQ) || data_symbols == 0 ||
+      parity_symbols == 0 || symbol_size == 0 ||
+      data_symbols > SIZE_MAX - parity_symbols ||
+      data_symbols > SIZE_MAX / symbol_size ||
+      parity_symbols > SIZE_MAX / symbol_size || data_symbols > UINT32_MAX ||
+      parity_symbols > UINT32_MAX || symbol_size > UINT32_MAX ||
+      (type == FEC_REED_SOLOMON && symbol_size > INT_MAX) ||
+      (type == FEC_REED_SOLOMON && data_symbols + parity_symbols > 255))
+    return NULL;
+
   fec_t *f = calloc(1, sizeof(fec_t));
   if (!f)
     return NULL;
@@ -65,9 +74,6 @@ fec_t *fec_create_ex(fec_type_t type, size_t data_symbols,
       return NULL;
     }
   } else if (type == FEC_RAPTORQ) {
-    f->rq_src_data = malloc(data_symbols * symbol_size);
-    f->rq_repair_out = malloc(parity_symbols * symbol_size);
-
     struct nanorq_core_mem_reqs reqs;
     nanorq_core_get_memory_reqs(data_symbols, 0, symbol_size, &reqs);
 
@@ -79,9 +85,8 @@ fec_t *fec_create_ex(fec_type_t type, size_t data_symbols,
     f->rq_dropped_esi = malloc(data_symbols * sizeof(uint32_t));
     f->rq_repair_esi = malloc(parity_symbols * sizeof(uint32_t));
 
-    if (!f->rq_src_data || !f->rq_repair_out || !f->rq_prep_mem ||
-        !f->rq_work_mem || !f->rq_ops || !f->rq_D || !f->rq_dropped_esi ||
-        !f->rq_repair_esi) {
+    if (!f->rq_prep_mem || !f->rq_work_mem || !f->rq_ops || !f->rq_D ||
+        !f->rq_dropped_esi || !f->rq_repair_esi) {
       fec_destroy(f);
       return NULL;
     }
@@ -103,8 +108,6 @@ void fec_destroy(fec_t *f) {
     free(f->shards);
     free(f->marks);
 
-    free(f->rq_src_data);
-    free(f->rq_repair_out);
     free(f->rq_prep_mem);
     free(f->rq_work_mem);
     free(f->rq_ops);
@@ -116,10 +119,19 @@ void fec_destroy(fec_t *f) {
   }
 }
 
-void fec_encode(fec_t *f, const uint8_t *const *data_blocks,
+bool fec_encode(fec_t *f, const uint8_t *const *data_blocks,
                 uint8_t *const *parity_blocks) {
-  if (!f)
-    return;
+  if (!f || !data_blocks || !parity_blocks)
+    return false;
+
+  for (size_t i = 0; i < f->data_symbols; i++) {
+    if (!data_blocks[i])
+      return false;
+  }
+  for (size_t i = 0; i < f->parity_symbols; i++) {
+    if (!parity_blocks[i])
+      return false;
+  }
 
   if (f->type == FEC_REED_SOLOMON) {
     size_t total_symbols = f->data_symbols + f->parity_symbols;
@@ -130,19 +142,20 @@ void fec_encode(fec_t *f, const uint8_t *const *data_blocks,
     for (size_t i = 0; i < f->parity_symbols; i++) {
       f->shards[f->data_symbols + i] = parity_blocks[i];
     }
-    reed_solomon_encode(f->rs, f->shards, total_symbols, f->symbol_size);
+    return reed_solomon_encode(f->rs, f->shards, (int)total_symbols,
+                               (int)f->symbol_size) == 0;
   } else if (f->type == FEC_RAPTORQ) {
     /* dynamic raptorq core encoding using preallocated context buffers */
     nanorq_core enc;
     if (!nanorq_core_encoder_new(f->data_symbols, 0, &enc)) {
-      return;
+      return false;
     }
 
     struct nanorq_core_mem_reqs reqs;
     nanorq_core_get_memory_reqs(f->data_symbols, 0, f->symbol_size, &reqs);
 
     if (!nanorq_core_prepare(&enc, f->rq_prep_mem, reqs.prepare_bytes)) {
-      return;
+      return false;
     }
 
     uint8_t *D = f->rq_D;
@@ -161,7 +174,7 @@ void fec_encode(fec_t *f, const uint8_t *const *data_blocks,
     nanorq_core_set_op_callback(&enc, &S_enc, ops_push);
 
     if (!nanorq_core_precalculate(&enc, f->rq_work_mem, reqs.work_bytes)) {
-      return;
+      return false;
     }
 
     ops_run(&enc, D, f->symbol_size, &S_enc);
@@ -169,15 +182,23 @@ void fec_encode(fec_t *f, const uint8_t *const *data_blocks,
     for (size_t i = 0; i < f->parity_symbols; i++) {
       ops_mix(&enc, D, f->symbol_size, f->data_symbols + i, parity_blocks[i]);
     }
+    return true;
   }
+
+  return false;
 }
 
 bool fec_decode(fec_t *f, uint8_t *const *blocks, const bool *missing_mask) {
-  if (!f)
+  if (!f || !blocks || !missing_mask)
     return false;
 
+  size_t total_symbols = f->data_symbols + f->parity_symbols;
+  for (size_t i = 0; i < total_symbols; i++) {
+    if (!blocks[i])
+      return false;
+  }
+
   if (f->type == FEC_REED_SOLOMON) {
-    size_t total_symbols = f->data_symbols + f->parity_symbols;
     /* populate shards and erasure marks */
     for (size_t i = 0; i < total_symbols; i++) {
       f->shards[i] = blocks[i];

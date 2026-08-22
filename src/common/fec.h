@@ -16,6 +16,8 @@
 
 typedef struct fec_t fec_t;
 
+/* A fec_t instance is reusable but must be confined to one thread at a time. */
+
 typedef enum { FEC_REED_SOLOMON, FEC_RAPTORQ } fec_type_t;
 
 /* create a forward error correction instance */
@@ -26,7 +28,7 @@ fec_t *fec_create(size_t data_symbols, size_t parity_symbols,
 void fec_destroy(fec_t *f);
 
 /* encode data symbols and output parity symbols */
-void fec_encode(fec_t *f, const uint8_t *const *data_blocks,
+bool fec_encode(fec_t *f, const uint8_t *const *data_blocks,
                 uint8_t *const *parity_blocks);
 
 /* decode received symbols. missing_mask represents indices of lost blocks */

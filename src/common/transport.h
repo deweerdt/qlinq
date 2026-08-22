@@ -100,6 +100,10 @@ typedef void (*transport_callback_t)(void *user_data,
 
 #define TRANSPORT_MAX_PATHS 4
 
+/* Wire and flow-control limits enforced by the transport. */
+#define TRANSPORT_MAX_RELIABLE_OBJECT_SIZE ((1024U * 1024U) - 16U)
+#define TRANSPORT_MAX_FEC_RECORD_SIZE UINT16_MAX
+
 typedef struct {
   const char *bind_hosts[TRANSPORT_MAX_PATHS];
   size_t num_bind_hosts;
@@ -110,6 +114,8 @@ typedef struct {
   const char *key_file;  /* required for server */
   const char *ca_file;   /* CA bundle path for validating peer certificates */
   bool verify_peer;      /* require and verify peer certificate (mTLS) */
+  bool allow_insecure_peer; /* explicit opt-in for tests; never use in
+                               production */
   transport_callback_t callback;
   void *user_data;
   uint8_t simulated_loss_rate; /* 0 to 100 representing percentage of packets to

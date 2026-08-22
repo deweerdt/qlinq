@@ -227,6 +227,8 @@ static void generate_update(const ifmon_list_t *prev, const ifmon_list_t *curr,
 #if defined(__linux__)
 int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
                    size_t scratchpad_size) {
+  if (!list || !scratchpad || scratchpad_size < sizeof(struct nlmsghdr))
+    return -1;
   list->count = 0;
   int fd = socket(AF_NETLINK, SOCK_RAW, NETLINK_ROUTE);
   if (fd < 0)
@@ -422,6 +424,8 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
 
 int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
                    size_t scratchpad_size) {
+  if (!list || !scratchpad || scratchpad_size < sizeof(struct rt_msghdr))
+    return -1;
   list->count = 0;
   int mib[6];
   mib[0] = CTL_NET;
@@ -559,6 +563,8 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
 #else
 int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
                    size_t scratchpad_size) {
+  if (!list || !scratchpad || scratchpad_size < sizeof(IP_ADAPTER_ADDRESSES))
+    return -1;
   list->count = 0;
   ULONG size = (ULONG)scratchpad_size;
 
@@ -680,7 +686,7 @@ static void *watcher_thread_func(void *arg) {
   fds[1].fd = w->stop_pipe[0];
   fds[1].events = POLLIN;
 
-  while (w->running) {
+  while (atomic_load_explicit(&w->running, memory_order_acquire)) {
     int ret;
     do {
       ret = poll(fds, 2, -1);
@@ -706,6 +712,8 @@ static void *watcher_thread_func(void *arg) {
 }
 
 int ifmon_watch_start(ifmon_watcher_t *w, ifmon_callback_t cb, void *userdata) {
+  if (!w || !cb)
+    return -1;
   memset(w, 0, sizeof(ifmon_watcher_t));
   w->cb = cb;
   w->userdata = userdata;
@@ -729,9 +737,9 @@ int ifmon_watch_start(ifmon_watcher_t *w, ifmon_callback_t cb, void *userdata) {
     return -1;
   }
 
-  w->running = 1;
+  atomic_store_explicit(&w->running, 1, memory_order_release);
   if (pthread_create(&w->thread, NULL, watcher_thread_func, w) != 0) {
-    w->running = 0;
+    atomic_store_explicit(&w->running, 0, memory_order_release);
     close(w->event_fd);
     close(w->stop_pipe[0]);
     close(w->stop_pipe[1]);
@@ -741,9 +749,9 @@ int ifmon_watch_start(ifmon_watcher_t *w, ifmon_callback_t cb, void *userdata) {
 }
 
 void ifmon_watch_stop(ifmon_watcher_t *w) {
-  if (!w || !w->running)
+  if (!w || !atomic_load_explicit(&w->running, memory_order_acquire))
     return;
-  w->running = 0;
+  atomic_store_explicit(&w->running, 0, memory_order_release);
   char c = 1;
   (void)write(w->stop_pipe[1], &c, 1);
   pthread_join(w->thread, NULL);
@@ -775,6 +783,8 @@ static VOID
 }
 
 int ifmon_watch_start(ifmon_watcher_t *w, ifmon_callback_t cb, void *userdata) {
+  if (!w || !cb)
+    return -1;
   memset(w, 0, sizeof(ifmon_watcher_t));
   w->cb = cb;
   w->userdata = userdata;
