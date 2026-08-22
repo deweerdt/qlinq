@@ -1,0 +1,20 @@
+#ifndef QLINQ_TRANSPORT_STREAM_H
+#define QLINQ_TRANSPORT_STREAM_H
+
+#include "transport.h"
+
+#include "quicly.h"
+
+#define TRANSPORT_WIRE_MAX_STREAM_PAYLOAD                                      \
+  (TRANSPORT_MAX_RELIABLE_OBJECT_SIZE + 1U)
+
+bool transport_stream_write_parts(quicly_stream_t *stream, uint8_t type,
+                                  const void *prefix, size_t prefix_len,
+                                  const void *payload, size_t payload_len);
+bool transport_stream_write_frame(quicly_stream_t *stream, uint8_t type,
+                                  const void *payload, size_t payload_len);
+bool transport_stream_write_track_frame(quicly_stream_t *stream, uint8_t type,
+                                        uint8_t alias,
+                                        const moq_track_id_t *track_id);
+
+#endif

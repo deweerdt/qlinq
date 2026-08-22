@@ -44,3 +44,9 @@ To run the test suite:
 ```bash
 make check
 ```
+
+The private peer protocol is documented in
+[docs/wire-protocol.md](docs/wire-protocol.md). Protocol version 1 is required
+on both peers; incompatible versions are rejected instead of being guessed.
+The implementation boundaries and ownership rules are described in
+[docs/transport-architecture.md](docs/transport-architecture.md).

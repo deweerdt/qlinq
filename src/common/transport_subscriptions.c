@@ -1,0 +1,166 @@
+#include "transport_subscriptions.h"
+
+#include "quicly/streambuf.h"
+
+#include <string.h>
+
+static bool track_matches(const moq_track_id_t *track, moq_track_type_t type,
+                          const char *name) {
+  return track && name && track->type == type && strcmp(track->name, name) == 0;
+}
+
+int transport_subscriptions_find_by_alias(
+    const transport_subscription_table_t *table, uint8_t alias,
+    moq_track_id_t *out_track) {
+  if (!table || !out_track)
+    return -1;
+  memset(out_track, 0, sizeof(*out_track));
+  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+    const track_subscription_t *entry = &table->entries[i];
+    if (entry->active && entry->alias == alias) {
+      *out_track = entry->track_id;
+      return 0;
+    }
+  }
+  return -1;
+}
+
+int transport_subscriptions_find_alias(
+    const transport_subscription_table_t *table, const moq_track_id_t *track,
+    uint8_t *out_alias) {
+  if (!table || !track || !out_alias)
+    return -1;
+  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+    const track_subscription_t *entry = &table->entries[i];
+    if (entry->active &&
+        track_matches(&entry->track_id, track->type, track->name)) {
+      *out_alias = entry->alias;
+      return 0;
+    }
+  }
+  return -1;
+}
+
+track_subscription_t *
+transport_subscriptions_find(transport_subscription_table_t *table,
+                             const moq_track_id_t *track) {
+  if (!table || !track)
+    return NULL;
+  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+    track_subscription_t *entry = &table->entries[i];
+    if (entry->active &&
+        track_matches(&entry->track_id, track->type, track->name))
+      return entry;
+  }
+  return NULL;
+}
+
+const track_subscription_t *
+transport_subscriptions_find_const(const transport_subscription_table_t *table,
+                                   const moq_track_id_t *track) {
+  if (!table || !track)
+    return NULL;
+  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+    const track_subscription_t *entry = &table->entries[i];
+    if (entry->active &&
+        track_matches(&entry->track_id, track->type, track->name))
+      return entry;
+  }
+  return NULL;
+}
+
+bool transport_subscriptions_contains(
+    const transport_subscription_table_t *table, const moq_track_id_t *track) {
+  return transport_subscriptions_find_const(table, track) != NULL;
+}
+
+bool transport_subscriptions_add(transport_subscription_table_t *table,
+                                 moq_track_type_t type, uint8_t flags,
+                                 const char *name, uint8_t alias) {
+  if (!table || !name)
+    return false;
+  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+    track_subscription_t *entry = &table->entries[i];
+    if (entry->active && track_matches(&entry->track_id, type, name)) {
+      entry->alias = alias;
+      entry->track_id.flags = flags;
+      return true;
+    }
+  }
+  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+    track_subscription_t *entry = &table->entries[i];
+    if (!entry->active) {
+      memset(entry, 0, sizeof(*entry));
+      entry->track_id.type = type;
+      entry->track_id.flags = flags;
+      size_t name_len = strnlen(name, sizeof(entry->track_id.name));
+      if (name_len >= sizeof(entry->track_id.name))
+        return false;
+      memcpy(entry->track_id.name, name, name_len + 1U);
+      entry->alias = alias;
+      entry->active = true;
+      return true;
+    }
+  }
+  return false;
+}
+
+void transport_subscriptions_remove(transport_subscription_table_t *table,
+                                    moq_track_type_t type, const char *name) {
+  if (!table || !name)
+    return;
+  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+    track_subscription_t *entry = &table->entries[i];
+    if (entry->active && track_matches(&entry->track_id, type, name)) {
+      entry->active = false;
+      if (entry->stream)
+        quicly_streambuf_egress_shutdown(entry->stream);
+      entry->stream = NULL;
+      return;
+    }
+  }
+}
+
+void transport_subscriptions_clear_stream(transport_subscription_table_t *table,
+                                          quicly_stream_t *stream) {
+  if (!table || !stream)
+    return;
+  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+    track_subscription_t *entry = &table->entries[i];
+    if (entry->active && entry->stream == stream) {
+      entry->stream = NULL;
+      return;
+    }
+  }
+}
+
+bool transport_subscriptions_bind_stream(transport_subscription_table_t *table,
+                                         uint8_t alias,
+                                         quicly_stream_t *stream) {
+  if (!table || !stream)
+    return false;
+  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+    track_subscription_t *entry = &table->entries[i];
+    if (entry->active && entry->alias == alias) {
+      entry->stream = stream;
+      return true;
+    }
+  }
+  return false;
+}
+
+int transport_subscriptions_next_alias(
+    const transport_subscription_table_t *table, int first_dynamic_alias) {
+  if (!table || first_dynamic_alias < 0 || first_dynamic_alias > UINT8_MAX)
+    return -1;
+  int next = first_dynamic_alias;
+  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+    const track_subscription_t *entry = &table->entries[i];
+    if (entry->active && entry->alias >= next) {
+      if (entry->alias == UINT8_MAX)
+        return -1;
+      next = entry->alias + 1;
+    }
+  }
+  return next;
+}

@@ -5,12 +5,17 @@
 #include "pathflow.h"
 #include "portable_sockets.h"
 #include "transport.h"
-#include <endian.h>
+#include "transport_fec_state.h"
+#include "transport_memory.h"
+#include "transport_paths.h"
+#include "transport_stream.h"
+#include "transport_subscriptions.h"
+#include "transport_tls.h"
+#include "transport_wire.h"
 #include <errno.h>
 #include <fcntl.h>
 #include <inttypes.h>
 #include <linux/errqueue.h>
-#include <openssl/pem.h>
 #include <pthread.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -42,43 +47,6 @@ static uint64_t get_time_ns(void) {
 #define FEC_ASSEMBLER_TIMEOUT_MS 2000
 #define FEC_NACK_DELAY_MS 25
 #define QUICLY_PATH_DATAGRAM_QUEUE_CAPACITY 256
-#define QUICLY_MAX_FLAT_PATHS 64
-
-#define SENT_CACHE_SIZE 256
-
-typedef struct {
-  uint8_t track_id;
-  uint32_t group_id;
-  uint32_t object_id;
-  uint16_t total_symbols;
-  uint16_t data_symbols;
-  uint16_t symbol_size;
-  uint32_t original_size;
-  uint16_t received_count;
-  uint16_t capacity_symbols;
-  uint16_t capacity_symbol_size;
-  uint8_t **buffers;
-  uint8_t *buffer_storage;
-  bool *received_mask;
-  bool *missing_mask;
-  uint16_t *missing_indices;
-  bool decoded;
-  uint8_t priority;
-  bool nack_sent;
-  int64_t first_symbol_time_ms;
-  int64_t last_activity_time_ms;
-  int64_t last_nack_time_ms;
-} frame_assembler_t;
-
-#define ARENA_MAX_FALLBACKS 1024
-
-typedef struct {
-  uint8_t *buffer;
-  size_t capacity;
-  size_t offset;
-  void *fallbacks[ARENA_MAX_FALLBACKS];
-  size_t fallback_count;
-} arena_t;
 
 typedef struct {
   uint32_t last_seen;
@@ -87,56 +55,6 @@ typedef struct {
   uint32_t group_id;
   int64_t detected_at_ms;
 } object_gap_state_t;
-
-static void *arena_alloc(arena_t *a, size_t size) {
-  if (!a || size > SIZE_MAX - 7)
-    return NULL;
-  size = (size + 7) & ~7;
-  if (size > a->capacity - a->offset) {
-    if (a->fallback_count >= ARENA_MAX_FALLBACKS)
-      return NULL;
-    void *ptr = calloc(1, size);
-    if (ptr)
-      a->fallbacks[a->fallback_count++] = ptr;
-    return ptr;
-  }
-  void *ptr = a->buffer + a->offset;
-  a->offset += size;
-  memset(ptr, 0, size);
-  return ptr;
-}
-
-static void arena_reset(arena_t *a) {
-  a->offset = 0;
-  for (size_t i = 0; i < a->fallback_count; i++) {
-    free(a->fallbacks[i]);
-  }
-  a->fallback_count = 0;
-}
-
-typedef struct {
-  moq_track_id_t track_id;
-  uint32_t group_id;
-  uint32_t object_id;
-  uint8_t *data;
-  size_t size;
-  uint8_t priority;
-  bool is_keyframe;
-  uint16_t total_symbols;
-  uint16_t data_symbols;
-  uint16_t symbol_size;
-} sent_object_cache_t;
-
-#define FEC_CACHE_SIZE 8
-
-typedef struct {
-  fec_type_t type;
-  size_t data_symbols;
-  size_t parity_symbols;
-  size_t symbol_size;
-  fec_t *fec;
-  uint64_t last_used_ns;
-} fec_cache_entry_t;
 
 struct transport_t {
   transport_callback_t callback;
@@ -179,8 +97,7 @@ struct transport_t {
   quicly_receive_datagram_frame_t receive_datagram;
 
   /* sent object history cache for NACK retransmissions */
-  sent_object_cache_t sent_cache[SENT_CACHE_SIZE];
-  size_t sent_cache_index;
+  transport_sent_cache_t sent_cache;
 
   /* simulated packet loss */
   uint8_t simulated_loss_rate;
@@ -204,129 +121,14 @@ struct transport_t {
   int ifmon_pipe[2];
 
   /* fec cache for zero-allocation hot path */
-  fec_cache_entry_t fec_cache[FEC_CACHE_SIZE];
+  transport_fec_cache_t fec_cache;
 };
-
-/* fetch or create a cached FEC context matching parameters */
-static fec_t *get_cached_fec(transport_t *t, fec_type_t type,
-                             size_t data_symbols, size_t parity_symbols,
-                             size_t symbol_size) {
-  uint64_t now = get_time_ns();
-  int lru_idx = 0;
-  uint64_t min_time = -1;
-
-  for (int i = 0; i < FEC_CACHE_SIZE; i++) {
-    if (t->fec_cache[i].fec && t->fec_cache[i].type == type &&
-        t->fec_cache[i].data_symbols == data_symbols &&
-        t->fec_cache[i].parity_symbols == parity_symbols &&
-        t->fec_cache[i].symbol_size == symbol_size) {
-      t->fec_cache[i].last_used_ns = now;
-      return t->fec_cache[i].fec;
-    }
-    if (t->fec_cache[i].last_used_ns < min_time) {
-      min_time = t->fec_cache[i].last_used_ns;
-      lru_idx = i;
-    }
-  }
-
-  /* cache miss, evict the lru entry */
-  if (t->fec_cache[lru_idx].fec) {
-    fec_destroy(t->fec_cache[lru_idx].fec);
-    t->fec_cache[lru_idx].fec = NULL;
-  }
-
-  fec_t *fec = fec_create_ex(type, data_symbols, parity_symbols, symbol_size);
-  if (fec) {
-    t->fec_cache[lru_idx].type = type;
-    t->fec_cache[lru_idx].data_symbols = data_symbols;
-    t->fec_cache[lru_idx].parity_symbols = parity_symbols;
-    t->fec_cache[lru_idx].symbol_size = symbol_size;
-    t->fec_cache[lru_idx].fec = fec;
-    t->fec_cache[lru_idx].last_used_ns = now;
-  }
-  return fec;
-}
-
-static bool sockaddr_endpoint_equal(const struct sockaddr *a,
-                                    const struct sockaddr *b) {
-  if (!a || !b || a->sa_family != b->sa_family)
-    return false;
-  if (a->sa_family == AF_INET) {
-    const struct sockaddr_in *a4 = (const struct sockaddr_in *)a;
-    const struct sockaddr_in *b4 = (const struct sockaddr_in *)b;
-    return a4->sin_port == b4->sin_port &&
-           a4->sin_addr.s_addr == b4->sin_addr.s_addr;
-  }
-  if (a->sa_family == AF_INET6) {
-    const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
-    const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
-    return a6->sin6_port == b6->sin6_port &&
-           a6->sin6_scope_id == b6->sin6_scope_id &&
-           memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(a6->sin6_addr)) == 0;
-  }
-  return false;
-}
-
-static bool sockaddr_address_equal(const struct sockaddr *a,
-                                   const struct sockaddr *b) {
-  if (!a || !b || a->sa_family != b->sa_family)
-    return false;
-  if (a->sa_family == AF_INET) {
-    return ((const struct sockaddr_in *)a)->sin_addr.s_addr ==
-           ((const struct sockaddr_in *)b)->sin_addr.s_addr;
-  }
-  if (a->sa_family == AF_INET6) {
-    const struct sockaddr_in6 *a6 = (const struct sockaddr_in6 *)a;
-    const struct sockaddr_in6 *b6 = (const struct sockaddr_in6 *)b;
-    return a6->sin6_scope_id == b6->sin6_scope_id &&
-           memcmp(&a6->sin6_addr, &b6->sin6_addr, sizeof(a6->sin6_addr)) == 0;
-  }
-  return false;
-}
-
-static size_t find_path_index_by_addresses(quicly_conn_t *quic,
-                                           const struct sockaddr *local,
-                                           const struct sockaddr *remote) {
-  for (size_t p = 0; p < QUICLY_MAX_FLAT_PATHS; p++) {
-    quicly_path_stats_t stats;
-    if (quicly_get_path_stats(quic, p, &stats) == 0 &&
-        sockaddr_endpoint_equal(&stats.local.sa, local) &&
-        sockaddr_endpoint_equal(&stats.remote.sa, remote))
-      return p;
-  }
-  return SIZE_MAX;
-}
-
-/* Helper to map a link/socket index to the QUIC path index by matching local
- * endpoints. */
-static size_t find_path_index_by_link(quicly_conn_t *quic, transport_t *t,
-                                      size_t link_idx) {
-  if (link_idx >= t->num_fds)
-    return 0;
-
-  for (size_t p = 0; p < QUICLY_MAX_FLAT_PATHS; p++) {
-    quicly_path_stats_t stats;
-    if (quicly_get_path_stats(quic, p, &stats) == 0 &&
-        sockaddr_address_equal(
-            &stats.local.sa,
-            (const struct sockaddr *)&t->local_addrs[link_idx]))
-      return p;
-  }
-  return 0;
-}
-
-typedef struct {
-  moq_track_id_t track_id;
-  uint8_t alias;
-  bool active;
-  quicly_stream_t *stream;
-} track_subscription_t;
 
 struct transport_conn_t {
   transport_t *transport;
   quicly_conn_t *quic;
   uint32_t id;
-  track_subscription_t subscriptions[32];
+  transport_subscription_table_t subscriptions;
   bool handshake_complete;
   bool authenticated;
 
@@ -337,74 +139,13 @@ struct transport_conn_t {
   frame_assembler_t assemblers[ASSEMBLER_CACHE_SIZE];
   size_t assembler_index;
   object_gap_state_t object_gaps[UINT8_MAX + 1U];
-  uint16_t queued_datagrams[QUICLY_MAX_FLAT_PATHS];
+  uint16_t queued_datagrams[TRANSPORT_MAX_QUIC_PATHS];
 };
-
-static void release_assembler(frame_assembler_t *a) {
-  if (!a)
-    return;
-  free(a->buffers);
-  free(a->buffer_storage);
-  free(a->received_mask);
-  free(a->missing_mask);
-  free(a->missing_indices);
-  memset(a, 0, sizeof(*a));
-}
-
-static bool grow_assembler(frame_assembler_t *a, uint16_t symbols,
-                           uint16_t symbol_size) {
-  if (!a || symbols == 0 || symbol_size == 0)
-    return false;
-  if (a->buffers && a->capacity_symbols >= symbols &&
-      a->capacity_symbol_size >= symbol_size)
-    return true;
-
-  uint16_t new_symbols =
-      a->capacity_symbols > symbols ? a->capacity_symbols : symbols;
-  uint16_t new_symbol_size = a->capacity_symbol_size > symbol_size
-                                 ? a->capacity_symbol_size
-                                 : symbol_size;
-  uint8_t **buffers = calloc(new_symbols, sizeof(*buffers));
-  uint8_t *storage = calloc(new_symbols, new_symbol_size);
-  bool *received = calloc(new_symbols, sizeof(*received));
-  bool *missing = calloc(new_symbols, sizeof(*missing));
-  uint16_t *indices = calloc(new_symbols, sizeof(*indices));
-  if (!buffers || !storage || !received || !missing || !indices) {
-    free(buffers);
-    free(storage);
-    free(received);
-    free(missing);
-    free(indices);
-    return false;
-  }
-  for (size_t i = 0; i < new_symbols; i++)
-    buffers[i] = storage + i * new_symbol_size;
-  if (a->buffers) {
-    for (size_t i = 0; i < a->total_symbols; i++) {
-      memcpy(buffers[i], a->buffers[i], a->symbol_size);
-      received[i] = a->received_mask[i];
-    }
-  }
-
-  free(a->buffers);
-  free(a->buffer_storage);
-  free(a->received_mask);
-  free(a->missing_mask);
-  free(a->missing_indices);
-  a->buffers = buffers;
-  a->buffer_storage = storage;
-  a->received_mask = received;
-  a->missing_mask = missing;
-  a->missing_indices = indices;
-  a->capacity_symbols = new_symbols;
-  a->capacity_symbol_size = new_symbol_size;
-  return true;
-}
 
 static bool queue_datagram(transport_conn_t *conn, size_t path_index,
                            ptls_iovec_t datagram) {
   quicly_path_stats_t path_stats;
-  if (!conn || !conn->quic || path_index >= QUICLY_MAX_FLAT_PATHS ||
+  if (!conn || !conn->quic || path_index >= TRANSPORT_MAX_QUIC_PATHS ||
       quicly_get_path_stats(conn->quic, path_index, &path_stats) != 0 ||
       conn->queued_datagrams[path_index] >= QUICLY_PATH_DATAGRAM_QUEUE_CAPACITY)
     return false;
@@ -413,138 +154,21 @@ static bool queue_datagram(transport_conn_t *conn, size_t path_index,
   return true;
 }
 
-static int find_subscription_by_alias(const transport_conn_t *conn,
-                                      uint8_t alias,
-                                      moq_track_id_t *out_track) {
-  if (!conn || !out_track)
-    return -1;
-  memset(out_track, 0, sizeof(*out_track));
-  for (int i = 0; i < 32; i++) {
-    if (conn->subscriptions[i].active &&
-        conn->subscriptions[i].alias == alias) {
-      *out_track = conn->subscriptions[i].track_id;
-      return 0;
-    }
-  }
-  return -1;
-}
-
-static int find_alias_by_track(const transport_conn_t *conn,
-                               const moq_track_id_t *track,
-                               uint8_t *out_alias) {
-  if (!conn || !track || !out_alias)
-    return -1;
-  for (int i = 0; i < 32; i++) {
-    if (conn->subscriptions[i].active &&
-        conn->subscriptions[i].track_id.type == track->type &&
-        strcmp(conn->subscriptions[i].track_id.name, track->name) == 0) {
-      *out_alias = conn->subscriptions[i].alias;
-      return 0;
-    }
-  }
-  return -1;
-}
-
-static bool is_subscribed(const transport_conn_t *conn,
-                          const moq_track_id_t *track) {
-  uint8_t dummy;
-  return find_alias_by_track(conn, track, &dummy) == 0;
-}
-
 static bool valid_track_type(uint8_t type) {
   return type == MOQ_TRACK_VIDEO || type == MOQ_TRACK_AUDIO ||
          type == MOQ_TRACK_INPUT || type == MOQ_TRACK_TEXT ||
          type == MOQ_TRACK_DATA || type == MOQ_TRACK_TELEMETRY;
 }
 
-static bool add_subscription(transport_conn_t *conn, moq_track_type_t type,
-                             uint8_t flags, const char *name, uint8_t alias) {
-  for (int i = 0; i < 32; i++) {
-    if (conn->subscriptions[i].active &&
-        conn->subscriptions[i].track_id.type == type &&
-        strcmp(conn->subscriptions[i].track_id.name, name) == 0) {
-      conn->subscriptions[i].alias = alias;
-      conn->subscriptions[i].track_id.flags = flags;
-      return true;
-    }
-  }
-  for (int i = 0; i < 32; i++) {
-    if (!conn->subscriptions[i].active) {
-      conn->subscriptions[i].track_id.type = type;
-      conn->subscriptions[i].track_id.flags = flags;
-      strncpy(conn->subscriptions[i].track_id.name, name,
-              sizeof(conn->subscriptions[i].track_id.name) - 1);
-      conn->subscriptions[i]
-          .track_id.name[sizeof(conn->subscriptions[i].track_id.name) - 1] =
-          '\0';
-      conn->subscriptions[i].alias = alias;
-      conn->subscriptions[i].active = true;
-      conn->subscriptions[i].stream = NULL;
-      return true;
-    }
-  }
-  return false;
+static void close_wire_error(transport_conn_t *conn,
+                             qlinq_wire_result_t result) {
+  const char *reason = result == QLINQ_WIRE_UNSUPPORTED_VERSION
+                           ? "protocol version mismatch"
+                           : "protocol error: malformed frame";
+  quicly_close(conn->quic, 0, reason);
 }
 
-static void remove_subscription(transport_conn_t *conn, moq_track_type_t type,
-                                const char *name) {
-  for (int i = 0; i < 32; i++) {
-    if (conn->subscriptions[i].active &&
-        conn->subscriptions[i].track_id.type == type &&
-        strcmp(conn->subscriptions[i].track_id.name, name) == 0) {
-      conn->subscriptions[i].active = false;
-      if (conn->subscriptions[i].stream) {
-        quicly_streambuf_egress_shutdown(conn->subscriptions[i].stream);
-        conn->subscriptions[i].stream = NULL;
-      }
-      return;
-    }
-  }
-}
-
-typedef struct __attribute__((packed)) {
-  uint8_t track_id;
-  uint8_t is_keyframe;
-  uint8_t priority;
-  uint32_t group_id;
-  uint32_t object_id;
-  uint16_t symbol_index;
-  uint16_t total_symbols;
-  uint16_t data_symbols;
-  uint16_t symbol_size;
-  uint32_t original_size;
-  uint8_t path_id;
-  uint64_t send_time_ns;
-} fec_packet_header_t;
-
-typedef struct __attribute__((packed)) {
-  uint8_t track_id;
-  uint8_t path_id;
-  uint64_t send_time_ns;
-  uint64_t recv_time_ns;
-} telemetry_datagram_t;
-
-static const uint16_t verify_algos[] = {
-    PTLS_SIGNATURE_ECDSA_SECP256R1_SHA256, PTLS_SIGNATURE_RSA_PSS_RSAE_SHA256,
-    PTLS_SIGNATURE_RSA_PKCS1_SHA256, UINT16_MAX};
-
-/* dummy verifier for local testing */
-static int verify_certificate_cb(
-    ptls_verify_certificate_t *self, ptls_t *tls, const char *server_name,
-    int (**verify_sign)(void *verify_ctx, uint16_t algo, ptls_iovec_t data,
-                        ptls_iovec_t sign),
-    void **verify_data, ptls_iovec_t *certs, size_t num_certs) {
-  (void)self;
-  (void)tls;
-  (void)server_name;
-  (void)verify_sign;
-  (void)verify_data;
-  (void)certs;
-  (void)num_certs;
-  return 0;
-}
-
-/* parse control stream signaling messages */
+/* Parse complete, versioned control frames from the stream buffer. */
 static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                                    quicly_stream_t *stream) {
   while (1) {
@@ -552,78 +176,80 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
     if (input.len == 0)
       break;
 
-    uint8_t type = input.base[0];
-    if (type == 0x01 || type == 0x02 || type == 0x06) {
-      if (input.len < 5)
+    qlinq_wire_frame_t frame;
+    qlinq_wire_result_t result = qlinq_wire_decode_frame(
+        input.base, input.len, TRANSPORT_WIRE_MAX_STREAM_PAYLOAD, &frame);
+    if (result == QLINQ_WIRE_NEED_MORE)
+      break;
+    if (result != QLINQ_WIRE_OK) {
+      close_wire_error(conn, result);
+      break;
+    }
+
+    input = ptls_iovec_init(frame.payload, frame.payload_len);
+    uint8_t type = frame.type;
+    if (type == QLINQ_WIRE_SUBSCRIBE || type == QLINQ_WIRE_UNSUBSCRIBE ||
+        type == QLINQ_WIRE_KEYFRAME_REQUEST) {
+      qlinq_wire_track_t wire_track;
+      if (qlinq_wire_decode_track(input.base, input.len, &wire_track) !=
+          QLINQ_WIRE_OK) {
+        quicly_close(conn->quic, 0, "protocol error: invalid track");
         break;
+      }
 
       if (!conn->authenticated) {
         quicly_close(conn->quic, 0, "unauthorized");
         break;
       }
 
-      uint8_t alias = input.base[1];
-      uint8_t track_type = input.base[2];
-      uint8_t flags = input.base[3];
-      uint8_t name_len = input.base[4];
-      if (input.len < 5 + (size_t)name_len)
-        break;
-
-      char name[64];
-      if (name_len > 63 || !valid_track_type(track_type) ||
+      uint8_t alias = wire_track.alias;
+      uint8_t track_type = wire_track.track_type;
+      uint8_t flags = wire_track.flags;
+      if (!valid_track_type(track_type) ||
           (flags & ~(MOQ_TRACK_FLAG_RELIABLE | MOQ_TRACK_FLAG_FEC_ENABLED |
                      MOQ_TRACK_FLAG_FEC_RATELESS)) != 0) {
         quicly_close(conn->quic, 0, "protocol error: invalid track");
         break;
       }
-      size_t copy_len = name_len;
-      memcpy(name, input.base + 5, copy_len);
-      name[copy_len] = '\0';
 
       moq_track_id_t parsed_track = {.type = (moq_track_type_t)track_type,
                                      .flags = flags};
-      strcpy(parsed_track.name, name);
+      strcpy(parsed_track.name, wire_track.name);
 
-      if (type == 0x01) {
+      if (type == QLINQ_WIRE_SUBSCRIBE) {
         quicly_debug_printf(
             conn->quic,
             "Subscription mapping: track '%s' (type %d) mapped to alias %d",
-            name, track_type, alias);
-        if (!add_subscription(conn, (moq_track_type_t)track_type, flags, name,
-                              alias)) {
+            wire_track.name, track_type, alias);
+        if (!transport_subscriptions_add(&conn->subscriptions,
+                                         (moq_track_type_t)track_type, flags,
+                                         wire_track.name, alias)) {
           quicly_close(conn->quic, 0, "protocol error: too many tracks");
           break;
         }
-      } else if (type == 0x02) {
-        remove_subscription(conn, (moq_track_type_t)track_type, name);
+      } else if (type == QLINQ_WIRE_UNSUBSCRIBE) {
+        transport_subscriptions_remove(&conn->subscriptions,
+                                       (moq_track_type_t)track_type,
+                                       wire_track.name);
       }
 
       transport_event_type_t ev_type = TRANSPORT_EVENT_SUBSCRIBE;
-      if (type == 0x02) {
+      if (type == QLINQ_WIRE_UNSUBSCRIBE) {
         ev_type = TRANSPORT_EVENT_UNSUBSCRIBE;
-      } else if (type == 0x06) {
+      } else if (type == QLINQ_WIRE_KEYFRAME_REQUEST) {
         ev_type = TRANSPORT_EVENT_KEYFRAME_REQUEST;
       }
 
       transport_event_t ev = {
           .type = ev_type, .conn = conn, .track_id = parsed_track};
       t->callback(t->user_data, &ev);
-      quicly_streambuf_ingress_shift(stream, 5 + name_len);
-    } else if (type == 0x03) {
-      if (input.len < 5)
-        break;
-
-      uint32_t payload_size;
-      memcpy(&payload_size, input.base + 1, 4);
-      payload_size = be32toh(payload_size);
-
+      quicly_streambuf_ingress_shift(stream, frame.consumed);
+    } else if (type == QLINQ_WIRE_UNICAST) {
+      size_t payload_size = input.len;
       if (payload_size > TRANSPORT_MAX_RELIABLE_OBJECT_SIZE) {
         quicly_close(conn->quic, 0, "protocol error: payload too large");
         break;
       }
-
-      if (input.len < 5 + payload_size)
-        break;
 
       if (!conn->authenticated) {
         quicly_close(conn->quic, 0, "unauthorized");
@@ -636,21 +262,17 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                               .object = {.track_id = {.type = MOQ_TRACK_INPUT},
                                          .group_id = 0,
                                          .object_id = 0,
-                                         .data = input.base + 5,
+                                         .data = input.base,
                                          .size = payload_size,
                                          .is_keyframe = false}};
       t->callback(t->user_data, &ev);
-      quicly_streambuf_ingress_shift(stream, 5 + payload_size);
-    } else if (type == 0x04) {
-      if (input.len < 3)
+      quicly_streambuf_ingress_shift(stream, frame.consumed);
+    } else if (type == QLINQ_WIRE_AUTH_REQUEST) {
+      size_t token_len = input.len;
+      if (token_len > UINT16_MAX) {
+        quicly_close(conn->quic, 0, "protocol error: auth token too large");
         break;
-
-      uint16_t token_len;
-      memcpy(&token_len, input.base + 1, 2);
-      token_len = be16toh(token_len);
-
-      if (input.len < 3 + (size_t)token_len)
-        break;
+      }
 
       if (!t->is_server) {
         quicly_close(conn->quic, 0, "protocol error: unexpected auth request");
@@ -659,21 +281,23 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
 
       transport_event_t ev = {.type = TRANSPORT_EVENT_AUTH,
                               .conn = conn,
-                              .auth = {.token = input.base + 3,
+                              .auth = {.token = input.base,
                                        .token_len = token_len,
                                        .success = false}};
       t->callback(t->user_data, &ev);
-      quicly_streambuf_ingress_shift(stream, 3 + token_len);
-    } else if (type == 0x05) {
-      if (input.len < 2)
+      quicly_streambuf_ingress_shift(stream, frame.consumed);
+    } else if (type == QLINQ_WIRE_AUTH_RESPONSE) {
+      if (input.len != 1 || input.base[0] > 1) {
+        quicly_close(conn->quic, 0, "protocol error: invalid auth response");
         break;
+      }
 
       if (t->is_server) {
         quicly_close(conn->quic, 0, "protocol error: unexpected auth response");
         break;
       }
 
-      uint8_t status = input.base[1];
+      uint8_t status = input.base[0];
       if (status == 1) {
         conn->authenticated = true;
       }
@@ -682,89 +306,34 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
           .conn = conn,
           .auth = {.token = NULL, .token_len = 0, .success = (status == 1)}};
       t->callback(t->user_data, &ev);
-      quicly_streambuf_ingress_shift(stream, 2);
-    } else if (type == 0x07) {
-      if (input.len < 6)
-        break;
-
-      uint8_t alias = input.base[1];
-      uint32_t payload_size;
-      memcpy(&payload_size, input.base + 2, 4);
-      payload_size = be32toh(payload_size);
-
-      if (payload_size > TRANSPORT_MAX_RELIABLE_OBJECT_SIZE) {
-        quicly_close(conn->quic, 0, "protocol error: payload too large");
-        break;
-      }
-
-      if (input.len < 6 + (size_t)payload_size)
-        break;
-
-      if (!conn->authenticated) {
-        quicly_close(conn->quic, 0, "unauthorized");
-        break;
-      }
-
-      moq_track_id_t resolved_track = {0};
-      if (find_subscription_by_alias(conn, alias, &resolved_track) == 0) {
-        resolved_track.flags &= ~MOQ_TRACK_FLAG_FEC_ENABLED;
-        resolved_track.flags |= MOQ_TRACK_FLAG_RELIABLE;
-        transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT,
-                                .conn = conn,
-                                .track_id = resolved_track,
-                                .object = {.track_id = resolved_track,
-                                           .group_id = 0,
-                                           .object_id = 0,
-                                           .data = input.base + 6,
-                                           .size = payload_size,
-                                           .is_keyframe = true}};
-        t->callback(t->user_data, &ev);
-      }
-      quicly_streambuf_ingress_shift(stream, 6 + payload_size);
-    } else if (type == 0x08) {
-      if (input.len < 12)
-        break;
-
-      uint8_t alias = input.base[1];
-      uint32_t group_id, object_id;
-      uint16_t wire_missing_count;
-      memcpy(&group_id, input.base + 2, 4);
-      memcpy(&object_id, input.base + 6, 4);
-      memcpy(&wire_missing_count, input.base + 10, 2);
-      group_id = be32toh(group_id);
-      object_id = be32toh(object_id);
-      wire_missing_count = be16toh(wire_missing_count);
-
-      if (wire_missing_count > FEC_MAX_TOTAL_SYMBOLS) {
+      quicly_streambuf_ingress_shift(stream, frame.consumed);
+    } else if (type == QLINQ_WIRE_TRACK_OBJECT) {
+      quicly_close(conn->quic, 0,
+                   "protocol error: track object on control stream");
+      break;
+    } else if (type == QLINQ_WIRE_NACK) {
+      qlinq_wire_nack_t nack;
+      if (qlinq_wire_decode_nack(input.base, input.len, &nack) !=
+          QLINQ_WIRE_OK) {
         quicly_close(conn->quic, 0, "protocol error: invalid nack");
         break;
       }
 
-      size_t nack_msg_len = 12 + (size_t)wire_missing_count * 2;
-      if (input.len < nack_msg_len)
-        break;
-
       if (!conn->authenticated) {
         quicly_close(conn->quic, 0, "unauthorized");
         break;
       }
 
-      uint16_t missing_count = wire_missing_count;
+      uint8_t alias = nack.alias;
+      uint32_t group_id = nack.group_id;
+      uint32_t object_id = nack.object_id;
+      uint16_t missing_count = nack.missing_count;
 
       moq_track_id_t resolved_track;
-      if (find_subscription_by_alias(conn, alias, &resolved_track) == 0) {
-        sent_object_cache_t *cached = NULL;
-        for (size_t i = 0; i < SENT_CACHE_SIZE; i++) {
-          if (t->sent_cache[i].data &&
-              t->sent_cache[i].track_id.type == resolved_track.type &&
-              strcmp(t->sent_cache[i].track_id.name, resolved_track.name) ==
-                  0 &&
-              t->sent_cache[i].group_id == group_id &&
-              t->sent_cache[i].object_id == object_id) {
-            cached = &t->sent_cache[i];
-            break;
-          }
-        }
+      if (transport_subscriptions_find_by_alias(&conn->subscriptions, alias,
+                                                &resolved_track) == 0) {
+        sent_object_cache_t *cached = transport_sent_cache_find(
+            &t->sent_cache, &resolved_track, group_id, object_id);
 
         if (cached) {
           size_t data_symbols = cached->data_symbols;
@@ -804,7 +373,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
             if (!alloc_failed) {
               fec_type_t fec_type =
                   (total_symbols > 255) ? FEC_RAPTORQ : FEC_REED_SOLOMON;
-              fec_t *fec = get_cached_fec(t, fec_type, data_symbols,
+              fec_t *fec =
+                  transport_fec_cache_get(&t->fec_cache, fec_type, data_symbols,
                                           parity_symbols, symbol_size);
               bool encoded = false;
               if (fec) {
@@ -815,24 +385,26 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
               for (size_t i = 0; encoded && i < parity_symbols; i++) {
                 uint16_t s = data_symbols + i;
 
-                size_t pkt_len = sizeof(fec_packet_header_t) + symbol_size;
+                size_t pkt_len = QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size;
                 uint8_t pkt_buf[2048]; /* max datagram size */
-                fec_packet_header_t *hdr = (fec_packet_header_t *)pkt_buf;
+                qlinq_wire_fec_header_t hdr = {
+                    .alias = alias,
+                    .is_keyframe = cached->is_keyframe,
+                    .priority = cached->priority,
+                    .path_id = 0,
+                    .group_id = (uint32_t)cached->group_id,
+                    .object_id = (uint32_t)cached->object_id,
+                    .symbol_index = s,
+                    .total_symbols = (uint16_t)total_symbols,
+                    .data_symbols = (uint16_t)data_symbols,
+                    .symbol_size = (uint16_t)symbol_size,
+                    .original_size = (uint32_t)cached->size,
+                    .send_time_ns = get_time_ns()};
+                if (qlinq_wire_encode_fec_header(pkt_buf, sizeof(pkt_buf),
+                                                 &hdr) != QLINQ_WIRE_OK)
+                  break;
 
-                hdr->track_id = alias;
-                hdr->is_keyframe = cached->is_keyframe ? 1 : 0;
-                hdr->priority = cached->priority;
-                hdr->group_id = htobe32((uint32_t)cached->group_id);
-                hdr->object_id = htobe32((uint32_t)cached->object_id);
-                hdr->symbol_index = htobe16((uint16_t)s);
-                hdr->total_symbols = htobe16((uint16_t)total_symbols);
-                hdr->data_symbols = htobe16((uint16_t)data_symbols);
-                hdr->symbol_size = htobe16((uint16_t)symbol_size);
-                hdr->original_size = htobe32((uint32_t)cached->size);
-                hdr->path_id = 0;
-                hdr->send_time_ns = htobe64(get_time_ns());
-
-                memcpy(pkt_buf + sizeof(fec_packet_header_t), parity_blocks[i],
+                memcpy(pkt_buf + QLINQ_WIRE_FEC_HEADER_SIZE, parity_blocks[i],
                        symbol_size);
 
                 ptls_iovec_t dgram = ptls_iovec_init(pkt_buf, pkt_len);
@@ -857,9 +429,10 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
           }
         }
       }
-      quicly_streambuf_ingress_shift(stream, nack_msg_len);
+      quicly_streambuf_ingress_shift(stream, frame.consumed);
     } else {
-      quicly_streambuf_ingress_shift(stream, 1);
+      quicly_close(conn->quic, 0, "protocol error: unexpected frame");
+      break;
     }
   }
 }
@@ -867,94 +440,77 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
 typedef struct {
   quicly_streambuf_t streambuf;
   bool is_control;
-  bool header_received;
+  bool alias_bound;
   uint8_t alias;
 } stream_ctx_t;
 
-static void clear_subscription_stream(transport_conn_t *conn,
-                                      quicly_stream_t *stream) {
-  for (int i = 0; i < 32; i++) {
-    if (conn->subscriptions[i].active &&
-        conn->subscriptions[i].stream == stream) {
-      conn->subscriptions[i].stream = NULL;
-      break;
-    }
-  }
-}
-
 static void on_stream_destroy(quicly_stream_t *stream, quicly_error_t err) {
   transport_conn_t *conn = *quicly_get_data(stream->conn);
-  if (conn) {
-    clear_subscription_stream(conn, stream);
-  }
+  if (conn)
+    transport_subscriptions_clear_stream(&conn->subscriptions, stream);
   quicly_streambuf_destroy(stream, err);
 }
 
 static void parse_track_stream_messages(transport_t *t, transport_conn_t *conn,
                                         quicly_stream_t *stream) {
   stream_ctx_t *ctx = (stream_ctx_t *)stream->data;
-
   while (1) {
     ptls_iovec_t input = quicly_streambuf_ingress_get(stream);
     if (input.len == 0)
       break;
 
-    if (!ctx->header_received) {
-      ctx->alias = input.base[0];
-      ctx->header_received = true;
-      quicly_streambuf_ingress_shift(stream, 1);
-
-      /* Map client-side stream pointer back to subscription */
-      for (int i = 0; i < 32; i++) {
-        if (conn->subscriptions[i].active &&
-            conn->subscriptions[i].alias == ctx->alias) {
-          conn->subscriptions[i].stream = stream;
-          quicly_debug_printf(conn->quic,
-                              "Mapped incoming QUIC Stream %" PRIu64
-                              " to MoQ track alias %d",
-                              stream->stream_id, ctx->alias);
-          break;
-        }
-      }
-
-      input = quicly_streambuf_ingress_get(stream);
-    }
-
-    if (input.len < 4)
+    qlinq_wire_frame_t frame;
+    qlinq_wire_result_t result = qlinq_wire_decode_frame(
+        input.base, input.len, TRANSPORT_WIRE_MAX_STREAM_PAYLOAD, &frame);
+    if (result == QLINQ_WIRE_NEED_MORE)
       break;
-
-    uint32_t payload_size;
-    memcpy(&payload_size, input.base, 4);
-    payload_size = be32toh(payload_size);
-
-    if (payload_size > TRANSPORT_MAX_RELIABLE_OBJECT_SIZE) {
-      quicly_close(conn->quic, 0, "protocol error: payload too large");
+    if (result != QLINQ_WIRE_OK) {
+      close_wire_error(conn, result);
       break;
     }
-
-    if (input.len < 4 + (size_t)payload_size)
+    if (frame.type != QLINQ_WIRE_TRACK_OBJECT || frame.payload_len < 1) {
+      quicly_close(conn->quic, 0, "protocol error: unexpected track frame");
       break;
+    }
 
     if (!conn->authenticated) {
       quicly_close(conn->quic, 0, "unauthorized");
       break;
     }
 
+    uint8_t alias = frame.payload[0];
+    size_t payload_size = frame.payload_len - 1;
+    if (ctx->alias_bound && ctx->alias != alias) {
+      quicly_close(conn->quic, 0, "protocol error: track alias changed");
+      break;
+    }
+    if (!ctx->alias_bound) {
+      ctx->alias = alias;
+      ctx->alias_bound = true;
+      if (transport_subscriptions_bind_stream(&conn->subscriptions, alias,
+                                              stream))
+        quicly_debug_printf(conn->quic,
+                            "Mapped incoming QUIC Stream %" PRIu64
+                            " to MoQ track alias %d",
+                            stream->stream_id, alias);
+    }
+
     moq_track_id_t resolved_track = {0};
-    if (find_subscription_by_alias(conn, ctx->alias, &resolved_track) == 0) {
+    if (transport_subscriptions_find_by_alias(&conn->subscriptions, alias,
+                                              &resolved_track) == 0) {
       transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT,
                               .conn = conn,
                               .track_id = resolved_track,
                               .object = {.track_id = resolved_track,
                                          .group_id = 0,
                                          .object_id = 0,
-                                         .data = input.base + 4,
+                                         .data = frame.payload + 1,
                                          .size = payload_size,
                                          .is_keyframe = true}};
       t->callback(t->user_data, &ev);
     }
 
-    quicly_streambuf_ingress_shift(stream, 4 + payload_size);
+    quicly_streambuf_ingress_shift(stream, frame.consumed);
   }
 }
 
@@ -1011,8 +567,7 @@ static quicly_error_t on_stream_open(quicly_stream_open_t *self,
 
   stream_ctx_t *ctx = (stream_ctx_t *)stream->data;
   ctx->is_control = (stream->stream_id == 0);
-  ctx->header_received = false;
-  ctx->alias = 0;
+  ctx->alias_bound = false;
 
   /* client saves the stream pointer */
   transport_conn_t *conn = *quicly_get_data(stream->conn);
@@ -1023,35 +578,17 @@ static quicly_error_t on_stream_open(quicly_stream_open_t *self,
   return 0;
 }
 
-static bool stream_write_frame(quicly_stream_t *stream, const void *header,
-                               size_t header_len, const void *payload,
-                               size_t payload_len) {
-  if (!stream || header_len > SIZE_MAX - payload_len ||
-      (payload_len > 0 && !payload))
-    return false;
-  size_t frame_len = header_len + payload_len;
-  uint8_t stack_buf[256];
-  uint8_t *frame =
-      frame_len <= sizeof(stack_buf) ? stack_buf : malloc(frame_len);
-  if (!frame)
-    return false;
-  memcpy(frame, header, header_len);
-  if (payload_len > 0)
-    memcpy(frame + header_len, payload, payload_len);
-  int ret = quicly_streambuf_egress_write(stream, frame, frame_len);
-  if (frame != stack_buf)
-    free(frame);
-  return ret == 0;
-}
-
 /* handle incoming datagram frames */
 static void send_nack(transport_conn_t *conn, uint8_t alias, uint32_t group_id,
-                      uint32_t object_id, uint16_t *missing, uint16_t count) {
+                      uint32_t object_id, const uint16_t *missing,
+                      uint16_t count) {
   if (!conn || !conn->stream ||
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return;
 
-  size_t payload_len = 12 + count * 2;
+  if (count > QLINQ_WIRE_MAX_NACK_SYMBOLS)
+    return;
+  size_t payload_len = 12U + (size_t)count * 2U;
   uint8_t static_buf[1024];
   uint8_t *buf = static_buf;
   if (payload_len > sizeof(static_buf)) {
@@ -1060,19 +597,11 @@ static void send_nack(transport_conn_t *conn, uint8_t alias, uint32_t group_id,
       return;
   }
 
-  buf[0] = 0x08;
-  buf[1] = alias;
-  uint32_t g = htobe32(group_id);
-  uint32_t o = htobe32(object_id);
-  uint16_t c = htobe16(count);
-  memcpy(buf + 2, &g, 4);
-  memcpy(buf + 6, &o, 4);
-  memcpy(buf + 10, &c, 2);
-  for (uint16_t i = 0; i < count; i++) {
-    uint16_t idx = htobe16(missing[i]);
-    memcpy(buf + 12 + i * 2, &idx, 2);
-  }
-  (void)stream_write_frame(conn->stream, buf, payload_len, NULL, 0);
+  size_t written = 0;
+  if (qlinq_wire_encode_nack(buf, payload_len, alias, group_id, object_id,
+                             missing, count, &written) == QLINQ_WIRE_OK)
+    (void)transport_stream_write_frame(conn->stream, QLINQ_WIRE_NACK, buf,
+                                       written);
 
   if (buf != static_buf) {
     free(buf);
@@ -1091,19 +620,21 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   if (!tconn->authenticated)
     return;
 
-  if (payload.len < 1)
+  uint8_t datagram_type;
+  qlinq_wire_result_t wire_result = qlinq_wire_decode_datagram_type(
+      payload.base, payload.len, &datagram_type);
+  if (wire_result != QLINQ_WIRE_OK)
     return;
 
-  uint8_t track_id = ((uint8_t *)payload.base)[0];
-
-  if (track_id == MOQ_TRACK_TELEMETRY) {
-    if (payload.len < sizeof(telemetry_datagram_t))
+  if (datagram_type == QLINQ_WIRE_DATAGRAM_TELEMETRY) {
+    qlinq_wire_telemetry_t telemetry;
+    if (qlinq_wire_decode_telemetry(payload.base, payload.len, &telemetry) !=
+        QLINQ_WIRE_OK)
       return;
-    telemetry_datagram_t *t_hdr = (telemetry_datagram_t *)payload.base;
-    uint8_t pid = t_hdr->path_id;
+    uint8_t pid = telemetry.path_id;
     if (pid < TRANSPORT_MAX_PATHS) {
-      uint64_t s_ns = be64toh(t_hdr->send_time_ns);
-      uint64_t r_ns = be64toh(t_hdr->recv_time_ns);
+      uint64_t s_ns = telemetry.send_time_ns;
+      uint64_t r_ns = telemetry.recv_time_ns;
 
       /* relative owd (queuing delay estimation) */
       int64_t current_owd = (int64_t)r_ns - (int64_t)s_ns;
@@ -1121,34 +652,37 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     return;
   }
 
-  if (payload.len < sizeof(fec_packet_header_t))
+  qlinq_wire_fec_header_t hdr;
+  if (qlinq_wire_decode_fec_header(payload.base, payload.len, &hdr) !=
+      QLINQ_WIRE_OK)
     return;
 
-  fec_packet_header_t *hdr = (fec_packet_header_t *)payload.base;
+  uint8_t track_id = hdr.alias;
   moq_track_id_t resolved_track;
-  if (find_subscription_by_alias(tconn, track_id, &resolved_track) != 0) {
+  if (transport_subscriptions_find_by_alias(&tconn->subscriptions, track_id,
+                                            &resolved_track) != 0) {
     return;
   }
 
   /* automatically send a telemetry reply to measure OWD */
-  telemetry_datagram_t reply;
-  reply.track_id = MOQ_TRACK_TELEMETRY;
-  reply.path_id = hdr->path_id;
-  reply.send_time_ns = hdr->send_time_ns; /* already network byte order */
-  reply.recv_time_ns = htobe64(get_time_ns());
-  ptls_iovec_t reply_vec;
-  reply_vec.base = (uint8_t *)&reply;
-  reply_vec.len = sizeof(reply);
-  (void)queue_datagram(tconn, hdr->path_id, reply_vec);
+  uint8_t reply[QLINQ_WIRE_TELEMETRY_SIZE];
+  qlinq_wire_telemetry_t telemetry = {.path_id = hdr.path_id,
+                                      .send_time_ns = hdr.send_time_ns,
+                                      .recv_time_ns = get_time_ns()};
+  if (qlinq_wire_encode_telemetry(reply, sizeof(reply), &telemetry) ==
+      QLINQ_WIRE_OK) {
+    ptls_iovec_t reply_vec = ptls_iovec_init(reply, sizeof(reply));
+    (void)queue_datagram(tconn, hdr.path_id, reply_vec);
+  }
 
-  uint8_t is_keyframe = hdr->is_keyframe;
-  uint32_t group_id = be32toh(hdr->group_id);
-  uint32_t object_id = be32toh(hdr->object_id);
-  uint16_t symbol_index = be16toh(hdr->symbol_index);
-  uint16_t total_symbols = be16toh(hdr->total_symbols);
-  uint16_t data_symbols = be16toh(hdr->data_symbols);
-  uint16_t symbol_size = be16toh(hdr->symbol_size);
-  uint32_t original_size = be32toh(hdr->original_size);
+  uint8_t is_keyframe = hdr.is_keyframe;
+  uint32_t group_id = hdr.group_id;
+  uint32_t object_id = hdr.object_id;
+  uint16_t symbol_index = hdr.symbol_index;
+  uint16_t total_symbols = hdr.total_symbols;
+  uint16_t data_symbols = hdr.data_symbols;
+  uint16_t symbol_size = hdr.symbol_size;
+  uint32_t original_size = hdr.original_size;
 
   if (total_symbols == 0 || total_symbols > FEC_MAX_TOTAL_SYMBOLS ||
       symbol_size == 0 || symbol_size > FEC_MAX_SYMBOL_SIZE ||
@@ -1161,7 +695,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
       original_size == 0)
     return;
 
-  if (payload.len < sizeof(fec_packet_header_t) + symbol_size)
+  if (payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size)
     return;
 
   if (resolved_track.type == MOQ_TRACK_DATA &&
@@ -1217,8 +751,9 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
 
     if (asm_slot->total_symbols > 0 && !asm_slot->decoded) {
       moq_track_id_t resolved_track;
-      if (find_subscription_by_alias(tconn, asm_slot->track_id,
-                                     &resolved_track) == 0) {
+      if (transport_subscriptions_find_by_alias(&tconn->subscriptions,
+                                                asm_slot->track_id,
+                                                &resolved_track) == 0) {
         transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
                                 .conn = tconn,
                                 .track_id = resolved_track,
@@ -1231,9 +766,9 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
 
     if (!asm_slot->buffers || asm_slot->capacity_symbols < total_symbols ||
         asm_slot->capacity_symbol_size < symbol_size) {
-      release_assembler(asm_slot);
-      if (!grow_assembler(asm_slot, total_symbols, symbol_size)) {
-        release_assembler(asm_slot);
+      transport_assembler_release(asm_slot);
+      if (!transport_assembler_grow(asm_slot, total_symbols, symbol_size)) {
+        transport_assembler_release(asm_slot);
         return;
       }
     }
@@ -1247,7 +782,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     asm_slot->data_symbols = data_symbols;
     asm_slot->symbol_size = symbol_size;
     asm_slot->original_size = original_size;
-    asm_slot->priority = hdr->priority;
+    asm_slot->priority = hdr.priority;
     asm_slot->decoded = false;
     asm_slot->received_count = 0;
     asm_slot->nack_sent = false;
@@ -1259,7 +794,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     return;
 
   if (total_symbols > asm_slot->total_symbols) {
-    if (!grow_assembler(asm_slot, total_symbols, symbol_size)) {
+    if (!transport_assembler_grow(asm_slot, total_symbols, symbol_size)) {
       return;
     }
     asm_slot->total_symbols = total_symbols;
@@ -1275,7 +810,7 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
 
   if (!asm_slot->received_mask[symbol_index]) {
     memcpy(asm_slot->buffers[symbol_index],
-           payload.base + sizeof(fec_packet_header_t), symbol_size);
+           payload.base + QLINQ_WIRE_FEC_HEADER_SIZE, symbol_size);
     asm_slot->received_mask[symbol_index] = true;
     asm_slot->received_count++;
     asm_slot->last_activity_time_ms = transport_get_time_ms();
@@ -1298,8 +833,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
       if (parity_symbols > 0) {
         fec_type_t fec_type =
             total_symbols > 255 ? FEC_RAPTORQ : FEC_REED_SOLOMON;
-        fec_t *fec = get_cached_fec(t, fec_type, data_symbols, parity_symbols,
-                                    symbol_size);
+        fec_t *fec = transport_fec_cache_get(
+            &t->fec_cache, fec_type, data_symbols, parity_symbols, symbol_size);
         if (fec) {
           for (size_t i = 0; i < total_symbols; i++) {
             asm_slot->missing_mask[i] = !asm_slot->received_mask[i];
@@ -1336,44 +871,9 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
                                          .priority = asm_slot->priority}};
       t->callback(t->user_data, &ev);
       free(full_data);
-      release_assembler(asm_slot);
+      transport_assembler_release(asm_slot);
     }
   }
-}
-
-static int load_certificate_and_key(ptls_context_t *tlsctx,
-                                    ptls_openssl_sign_certificate_t *sign_cert,
-                                    const char *cert_file,
-                                    const char *key_file) {
-  if (!cert_file || !key_file) {
-    fprintf(stderr, "certificate file and key file are required\n");
-    return -1;
-  }
-
-  if (ptls_load_certificates(tlsctx, (char *)cert_file) != 0) {
-    fprintf(stderr, "failed to load certificates\n");
-    return -1;
-  }
-
-  FILE *fp = fopen(key_file, "r");
-  if (!fp) {
-    fprintf(stderr, "failed to open private key file\n");
-    return -1;
-  }
-  EVP_PKEY *pkey = PEM_read_PrivateKey(fp, NULL, NULL, NULL);
-  fclose(fp);
-  if (!pkey) {
-    fprintf(stderr, "failed to load private key\n");
-    return -1;
-  }
-  if (ptls_openssl_init_sign_certificate(sign_cert, pkey) != 0) {
-    EVP_PKEY_free(pkey);
-    fprintf(stderr, "failed to initialize certificate signer\n");
-    return -1;
-  }
-  EVP_PKEY_free(pkey);
-  tlsctx->sign_certificate = &sign_cert->super;
-  return 0;
 }
 
 typedef struct {
@@ -1563,11 +1063,7 @@ transport_t *transport_create(const transport_config_t *config) {
   t->ifmon_pipe[0] = -1;
   t->ifmon_pipe[1] = -1;
 
-  t->arena.capacity = 16 * 1024 * 1024;
-  t->arena.buffer = malloc(t->arena.capacity);
-  t->arena.offset = 0;
-  t->arena.fallback_count = 0;
-  if (!t->arena.buffer) {
+  if (!transport_arena_init(&t->arena, 16U * 1024U * 1024U)) {
     free(t);
     return NULL;
   }
@@ -1670,8 +1166,9 @@ transport_t *transport_create(const transport_config_t *config) {
   }
 
   if (t->is_server || (config->cert_file && config->key_file)) {
-    if (load_certificate_and_key(&t->tls_ctx, &t->sign_cert, config->cert_file,
-                                 config->key_file) != 0) {
+    if (transport_tls_load_certificate_and_key(&t->tls_ctx, &t->sign_cert,
+                                               config->cert_file,
+                                               config->key_file) != 0) {
       transport_destroy(t);
       return NULL;
     }
@@ -1712,8 +1209,7 @@ transport_t *transport_create(const transport_config_t *config) {
       t->tls_ctx.require_client_authentication = 1;
     }
   } else {
-    t->verifier.super.cb = verify_certificate_cb;
-    t->verifier.super.algos = verify_algos;
+    transport_tls_init_insecure_verifier(&t->verifier);
     t->tls_ctx.verify_certificate = &t->verifier.super;
     t->verifier_initialized = false;
   }
@@ -1797,35 +1293,21 @@ void transport_destroy(transport_t *t) {
       transport_conn_t *conn = t->conns[i];
       quicly_free(conn->quic);
       for (size_t a = 0; a < ASSEMBLER_CACHE_SIZE; a++)
-        release_assembler(&conn->assemblers[a]);
+        transport_assembler_release(&conn->assemblers[a]);
       free(conn);
     }
   } else if (t->client_conn) {
     transport_conn_t *conn = t->client_conn;
     quicly_free(conn->quic);
     for (size_t a = 0; a < ASSEMBLER_CACHE_SIZE; a++)
-      release_assembler(&conn->assemblers[a]);
+      transport_assembler_release(&conn->assemblers[a]);
     free(conn);
   }
 
-  for (size_t i = 0; i < SENT_CACHE_SIZE; i++) {
-    if (t->sent_cache[i].data) {
-      free(t->sent_cache[i].data);
-    }
-  }
+  transport_sent_cache_destroy(&t->sent_cache);
+  transport_fec_cache_destroy(&t->fec_cache);
 
-  for (size_t i = 0; i < FEC_CACHE_SIZE; i++) {
-    if (t->fec_cache[i].fec) {
-      fec_destroy(t->fec_cache[i].fec);
-    }
-  }
-
-  if (t->arena.buffer) {
-    free(t->arena.buffer);
-  }
-  for (size_t i = 0; i < t->arena.fallback_count; i++) {
-    free(t->arena.fallbacks[i]);
-  }
+  transport_arena_destroy(&t->arena);
 
   if (t->quic_ctx.cid_encryptor != NULL) {
     quicly_free_default_cid_encryptor(t->quic_ctx.cid_encryptor);
@@ -1890,8 +1372,9 @@ void transport_tick(transport_t *t) {
       if (now_nack_ms - asm_slot->last_activity_time_ms >=
           FEC_ASSEMBLER_TIMEOUT_MS) {
         moq_track_id_t resolved_track;
-        if (find_subscription_by_alias(conn, asm_slot->track_id,
-                                       &resolved_track) == 0) {
+        if (transport_subscriptions_find_by_alias(&conn->subscriptions,
+                                                  asm_slot->track_id,
+                                                  &resolved_track) == 0) {
           transport_event_t ev = {.type = TRANSPORT_EVENT_OBJECT_LOST,
                                   .conn = conn,
                                   .track_id = resolved_track,
@@ -1900,7 +1383,7 @@ void transport_tick(transport_t *t) {
                                              .object_id = asm_slot->object_id}};
           t->callback(t->user_data, &ev);
         }
-        release_assembler(asm_slot);
+        transport_assembler_release(asm_slot);
         continue;
       }
 
@@ -1909,8 +1392,9 @@ void transport_tick(transport_t *t) {
           (!asm_slot->nack_sent ||
            now_nack_ms - asm_slot->last_nack_time_ms >= FEC_NACK_DELAY_MS)) {
         moq_track_id_t resolved_track;
-        if (find_subscription_by_alias(conn, asm_slot->track_id,
-                                       &resolved_track) == 0) {
+        if (transport_subscriptions_find_by_alias(&conn->subscriptions,
+                                                  asm_slot->track_id,
+                                                  &resolved_track) == 0) {
           if (!(resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS))
             continue; /* Fixed RS-FEC does not send NACKs */
         }
@@ -2206,7 +1690,8 @@ void transport_tick(transport_t *t) {
           fp_t path_p = p;
           quicly_path_stats_t path_stats;
 
-          size_t path_idx = find_path_index_by_link(target->quic, t, i);
+          size_t path_idx = transport_path_find_by_link(
+              target->quic, t->local_addrs, t->num_fds, i);
           if (quicly_get_path_stats(target->quic, path_idx, &path_stats) == 0) {
             if (path_stats.rtt_smoothed > 0) {
               path_l = FP_DIV(FP_FROM_INT(path_stats.rtt_smoothed),
@@ -2257,8 +1742,8 @@ void transport_tick(transport_t *t) {
         }
 
         size_t sent_path =
-            find_path_index_by_addresses(conn->quic, &src.sa, &dest.sa);
-        if (sent_path < QUICLY_MAX_FLAT_PATHS)
+            transport_path_find_by_addresses(conn->quic, &src.sa, &dest.sa);
+        if (sent_path < TRANSPORT_MAX_QUIC_PATHS)
           conn->queued_datagrams[sent_path] = 0;
 
         int out_fd = t->fds[0];
@@ -2352,9 +1837,6 @@ void transport_tick(transport_t *t) {
               if (sret != -1) {
                 /* GSO write succeeded, skip sendmmsg fallback */
                 num_dgrams = 0;
-              } else {
-                /* GSO failed, will fallback to sendmmsg */
-                use_gso = false;
               }
             }
           }
@@ -2416,7 +1898,7 @@ void transport_tick(transport_t *t) {
 
         quicly_free(conn->quic);
         for (size_t a = 0; a < ASSEMBLER_CACHE_SIZE; a++)
-          release_assembler(&conn->assemblers[a]);
+          transport_assembler_release(&conn->assemblers[a]);
         free(conn);
 
         if (t->is_server) {
@@ -2470,17 +1952,6 @@ static bool track_id_equal(const moq_track_id_t *a, const moq_track_id_t *b) {
          strcmp(a->name, b->name) == 0;
 }
 
-static size_t select_physical_path(const path_t *paths, size_t num_paths,
-                                   size_t symbol_index) {
-  size_t accumulated = 0;
-  for (size_t i = 0; i < num_paths; i++) {
-    accumulated += paths[i].x;
-    if (symbol_index < accumulated)
-      return i;
-  }
-  return 0;
-}
-
 static bool flush_fec_buffer(transport_t *t) {
   if (t->fec_buf_len == 0)
     return true;
@@ -2520,18 +1991,13 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
         transport_conn_t *conn = t->conns[c];
         if (conn && conn->quic &&
             quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING) {
-          for (int s = 0; s < 32; s++) {
-            if (conn->subscriptions[s].active &&
-                conn->subscriptions[s].track_id.type == obj->track_id.type &&
-                strcmp(conn->subscriptions[s].track_id.name,
-                       obj->track_id.name) == 0) {
-              track_delivery_profile_t profile =
-                  get_track_profile(&conn->subscriptions[s].track_id);
-              if (profile.fec_enabled || profile.fec_rateless) {
-                use_fec = true;
-                break;
-              }
-            }
+          const track_subscription_t *subscription =
+              transport_subscriptions_find_const(&conn->subscriptions,
+                                                 &obj->track_id);
+          if (subscription) {
+            track_delivery_profile_t sub_profile =
+                get_track_profile(&subscription->track_id);
+            use_fec = sub_profile.fec_enabled || sub_profile.fec_rateless;
           }
           if (use_fec)
             break;
@@ -2539,18 +2005,13 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
       }
     } else if (t->client_conn) {
       transport_conn_t *conn = t->client_conn;
-      for (int s = 0; s < 32; s++) {
-        if (conn->subscriptions[s].active &&
-            conn->subscriptions[s].track_id.type == obj->track_id.type &&
-            strcmp(conn->subscriptions[s].track_id.name, obj->track_id.name) ==
-                0) {
-          track_delivery_profile_t profile =
-              get_track_profile(&conn->subscriptions[s].track_id);
-          if (profile.fec_enabled || profile.fec_rateless) {
-            use_fec = true;
-            break;
-          }
-        }
+      const track_subscription_t *subscription =
+          transport_subscriptions_find_const(&conn->subscriptions,
+                                             &obj->track_id);
+      if (subscription) {
+        track_delivery_profile_t sub_profile =
+            get_track_profile(&subscription->track_id);
+        use_fec = sub_profile.fec_enabled || sub_profile.fec_rateless;
       }
     }
 
@@ -2624,22 +2085,13 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
       if (!conn || !conn->quic ||
           quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
         continue;
-      if (t->is_server && !is_subscribed(conn, &obj->track_id))
+      if (t->is_server && !transport_subscriptions_contains(
+                              &conn->subscriptions, &obj->track_id))
         continue;
 
-      int sub_idx = -1;
-      for (int s = 0; s < 32; s++) {
-        if (conn->subscriptions[s].active &&
-            conn->subscriptions[s].track_id.type == obj->track_id.type &&
-            strcmp(conn->subscriptions[s].track_id.name, obj->track_id.name) ==
-                0) {
-          sub_idx = s;
-          break;
-        }
-      }
-
-      if (sub_idx >= 0) {
-        track_subscription_t *sub = &conn->subscriptions[sub_idx];
+      track_subscription_t *sub =
+          transport_subscriptions_find(&conn->subscriptions, &obj->track_id);
+      if (sub) {
         if (!sub->stream ||
             !quicly_sendstate_is_open(&sub->stream->sendstate)) {
           sub->stream = NULL;
@@ -2650,21 +2102,16 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
                                 "Opened QUIC Stream %" PRIu64
                                 " for MoQ track alias %d",
                                 sub->stream->stream_id, sub->alias);
-            uint8_t alias = sub->alias;
-            if (!stream_write_frame(sub->stream, &alias, 1, NULL, 0)) {
-              quicly_reset_stream(sub->stream, 1);
-              sub->stream = NULL;
-              return false;
-            }
           } else {
             fprintf(stderr, "Failed to open reliable track stream: %d\n", err);
             continue;
           }
         }
 
-        uint32_t sz = htobe32((uint32_t)obj->size);
-        if (!stream_write_frame(sub->stream, &sz, sizeof(sz), obj->data,
-                                obj->size))
+        uint8_t alias = sub->alias;
+        if (!transport_stream_write_parts(sub->stream, QLINQ_WIRE_TRACK_OBJECT,
+                                          &alias, sizeof(alias), obj->data,
+                                          obj->size))
           return false;
       } else {
         if (!transport_send_unicast(t, conn, obj->data, obj->size))
@@ -2816,11 +2263,11 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
   }
 
   uint8_t **data_blocks =
-      arena_alloc(&t->arena, data_symbols * sizeof(uint8_t *));
+      transport_arena_alloc(&t->arena, data_symbols * sizeof(uint8_t *));
   uint8_t **parity_blocks =
-      arena_alloc(&t->arena, parity_symbols * sizeof(uint8_t *));
+      transport_arena_alloc(&t->arena, parity_symbols * sizeof(uint8_t *));
   if (!data_blocks || (parity_symbols > 0 && !parity_blocks)) {
-    arena_reset(&t->arena);
+    transport_arena_reset(&t->arena);
     return false;
   }
 
@@ -2832,9 +2279,9 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
       data_blocks[i] = (uint8_t *)obj->data + offset;
     } else {
       /* Allocate and zero-pad the final symbol block */
-      data_blocks[i] = arena_alloc(&t->arena, symbol_size);
+      data_blocks[i] = transport_arena_alloc(&t->arena, symbol_size);
       if (!data_blocks[i]) {
-        arena_reset(&t->arena);
+        transport_arena_reset(&t->arena);
         return false;
       }
       if (chunk > 0) {
@@ -2844,16 +2291,16 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
   }
 
   for (size_t i = 0; i < parity_symbols; i++) {
-    parity_blocks[i] = arena_alloc(&t->arena, symbol_size);
+    parity_blocks[i] = transport_arena_alloc(&t->arena, symbol_size);
     if (!parity_blocks[i]) {
-      arena_reset(&t->arena);
+      transport_arena_reset(&t->arena);
       return false;
     }
   }
 
   size_t total_symbols = data_symbols + parity_symbols;
   if (total_symbols > FEC_MAX_TOTAL_SYMBOLS || total_symbols > UINT16_MAX) {
-    arena_reset(&t->arena);
+    transport_arena_reset(&t->arena);
     return false;
   }
 
@@ -2863,14 +2310,14 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
     } else if (fec_type == FEC_RAPTORQ) {
       fec_type = FEC_REED_SOLOMON;
     }
-    fec_t *fec =
-        get_cached_fec(t, fec_type, data_symbols, parity_symbols, symbol_size);
+    fec_t *fec = transport_fec_cache_get(&t->fec_cache, fec_type, data_symbols,
+                                         parity_symbols, symbol_size);
     if (!fec) {
-      arena_reset(&t->arena);
+      transport_arena_reset(&t->arena);
       return false;
     }
     if (!fec_encode(fec, (const uint8_t *const *)data_blocks, parity_blocks)) {
-      arena_reset(&t->arena);
+      transport_arena_reset(&t->arena);
       return false;
     }
   }
@@ -2883,20 +2330,24 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
     transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
     if (!conn || !conn->quic ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING ||
-        (t->is_server && !is_subscribed(conn, &obj->track_id)))
+        (t->is_server && !transport_subscriptions_contains(&conn->subscriptions,
+                                                           &obj->track_id)))
       continue;
     uint8_t alias;
-    if (find_alias_by_track(conn, &obj->track_id, &alias) != 0)
+    if (transport_subscriptions_find_alias(&conn->subscriptions, &obj->track_id,
+                                           &alias) != 0)
       continue;
-    uint16_t needed[QUICLY_MAX_FLAT_PATHS] = {0};
+    uint16_t needed[TRANSPORT_MAX_QUIC_PATHS] = {0};
     for (size_t s = 0; s < total_symbols; s++) {
-      size_t physical = select_physical_path(paths_array, t->num_fds, s);
-      size_t mapped = find_path_index_by_link(conn->quic, t, physical);
-      if (mapped >= QUICLY_MAX_FLAT_PATHS ||
+      size_t physical =
+          transport_path_select_physical(paths_array, t->num_fds, s);
+      size_t mapped = transport_path_find_by_link(conn->quic, t->local_addrs,
+                                                  t->num_fds, physical);
+      if (mapped >= TRANSPORT_MAX_QUIC_PATHS ||
           ++needed[mapped] > QUICLY_PATH_DATAGRAM_QUEUE_CAPACITY ||
           conn->queued_datagrams[mapped] >
               QUICLY_PATH_DATAGRAM_QUEUE_CAPACITY - needed[mapped]) {
-        arena_reset(&t->arena);
+        transport_arena_reset(&t->arena);
         return false;
       }
     }
@@ -2908,75 +2359,68 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
     if (!conn || !conn->quic ||
         quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
       continue;
-    if (t->is_server && !is_subscribed(conn, &obj->track_id))
+    if (t->is_server &&
+        !transport_subscriptions_contains(&conn->subscriptions, &obj->track_id))
       continue;
     uint8_t alias;
-    if (find_alias_by_track(conn, &obj->track_id, &alias) != 0)
+    if (transport_subscriptions_find_alias(&conn->subscriptions, &obj->track_id,
+                                           &alias) != 0)
       continue;
     sent_to_peer = true;
     for (size_t s = 0; s < total_symbols; s++) {
-      size_t pkt_len = sizeof(fec_packet_header_t) + symbol_size;
-      uint8_t *pkt_buf = arena_alloc(&t->arena, pkt_len);
+      size_t pkt_len = QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size;
+      uint8_t *pkt_buf = transport_arena_alloc(&t->arena, pkt_len);
       if (!pkt_buf) {
-        arena_reset(&t->arena);
+        transport_arena_reset(&t->arena);
         return false;
       }
-      fec_packet_header_t *hdr = (fec_packet_header_t *)pkt_buf;
-
-      size_t path_idx = select_physical_path(paths_array, t->num_fds, s);
-
-      hdr->track_id = alias;
-      hdr->is_keyframe = obj->is_keyframe ? 1 : 0;
-      hdr->priority = obj->priority;
-      hdr->group_id = htobe32((uint32_t)obj->group_id);
-      hdr->object_id = htobe32((uint32_t)obj->object_id);
-      hdr->symbol_index = htobe16((uint16_t)s);
-      hdr->total_symbols = htobe16((uint16_t)total_symbols);
-      hdr->data_symbols = htobe16((uint16_t)data_symbols);
-      hdr->symbol_size = htobe16((uint16_t)symbol_size);
-      hdr->original_size = htobe32((uint32_t)data_size);
-      size_t mapped_path_idx = find_path_index_by_link(conn->quic, t, path_idx);
-      hdr->path_id = mapped_path_idx;
-      hdr->send_time_ns = htobe64(get_time_ns());
+      size_t path_idx =
+          transport_path_select_physical(paths_array, t->num_fds, s);
+      size_t mapped_path_idx = transport_path_find_by_link(
+          conn->quic, t->local_addrs, t->num_fds, path_idx);
+      if (mapped_path_idx > UINT8_MAX) {
+        transport_arena_reset(&t->arena);
+        return false;
+      }
+      qlinq_wire_fec_header_t hdr = {.alias = alias,
+                                     .is_keyframe = obj->is_keyframe,
+                                     .priority = obj->priority,
+                                     .path_id = (uint8_t)mapped_path_idx,
+                                     .group_id = (uint32_t)obj->group_id,
+                                     .object_id = (uint32_t)obj->object_id,
+                                     .symbol_index = (uint16_t)s,
+                                     .total_symbols = (uint16_t)total_symbols,
+                                     .data_symbols = (uint16_t)data_symbols,
+                                     .symbol_size = (uint16_t)symbol_size,
+                                     .original_size = (uint32_t)data_size,
+                                     .send_time_ns = get_time_ns()};
+      if (qlinq_wire_encode_fec_header(pkt_buf, pkt_len, &hdr) !=
+          QLINQ_WIRE_OK) {
+        transport_arena_reset(&t->arena);
+        return false;
+      }
 
       if (s < data_symbols) {
-        memcpy(pkt_buf + sizeof(fec_packet_header_t), data_blocks[s],
+        memcpy(pkt_buf + QLINQ_WIRE_FEC_HEADER_SIZE, data_blocks[s],
                symbol_size);
       } else {
-        memcpy(pkt_buf + sizeof(fec_packet_header_t),
+        memcpy(pkt_buf + QLINQ_WIRE_FEC_HEADER_SIZE,
                parity_blocks[s - data_symbols], symbol_size);
       }
 
       ptls_iovec_t dgram = ptls_iovec_init(pkt_buf, pkt_len);
       if (!queue_datagram(conn, mapped_path_idx, dgram)) {
-        arena_reset(&t->arena);
+        transport_arena_reset(&t->arena);
         return false;
       }
     }
   }
 
-  if (sent_to_peer && obj->track_id.type == MOQ_TRACK_DATA) {
-    sent_object_cache_t *slot = &t->sent_cache[t->sent_cache_index];
-    if (slot->data) {
-      free(slot->data);
-    }
-    slot->track_id = obj->track_id;
-    slot->group_id = obj->group_id;
-    slot->object_id = obj->object_id;
-    slot->size = obj->size;
-    slot->priority = obj->priority;
-    slot->is_keyframe = obj->is_keyframe;
-    slot->total_symbols = total_symbols;
-    slot->data_symbols = data_symbols;
-    slot->symbol_size = symbol_size;
-    slot->data = malloc(obj->size);
-    if (slot->data) {
-      memcpy(slot->data, obj->data, obj->size);
-    }
-    t->sent_cache_index = (t->sent_cache_index + 1) % SENT_CACHE_SIZE;
-  }
+  if (sent_to_peer && obj->track_id.type == MOQ_TRACK_DATA)
+    transport_sent_cache_store(&t->sent_cache, obj, (uint16_t)total_symbols,
+                               (uint16_t)data_symbols, (uint16_t)symbol_size);
 
-  arena_reset(&t->arena);
+  transport_arena_reset(&t->arena);
 
   return true;
 }
@@ -2993,29 +2437,24 @@ bool transport_subscribe(transport_t *t, moq_track_id_t track_id) {
         continue;
 
       uint8_t alias;
-      if (find_alias_by_track(conn, &track_id, &alias) != 0) {
+      if (transport_subscriptions_find_alias(&conn->subscriptions, &track_id,
+                                             &alias) != 0) {
         if (track_id.name[0] == '\0') {
           alias = (uint8_t)track_id.type;
         } else {
-          int next_alias = 8;
-          for (int j = 0; j < 32; j++) {
-            if (conn->subscriptions[j].active &&
-                conn->subscriptions[j].alias >= next_alias) {
-              next_alias = conn->subscriptions[j].alias + 1;
-            }
-          }
+          int next_alias =
+              transport_subscriptions_next_alias(&conn->subscriptions, 8);
+          if (next_alias < 0)
+            return false;
           alias = (uint8_t)next_alias;
         }
-        if (!add_subscription(conn, track_id.type, track_id.flags,
-                              track_id.name, alias))
+        if (!transport_subscriptions_add(&conn->subscriptions, track_id.type,
+                                         track_id.flags, track_id.name, alias))
           return false;
       }
 
-      uint8_t name_len = (uint8_t)strlen(track_id.name);
-      uint8_t msg_hdr[5] = {0x01, alias, (uint8_t)track_id.type, track_id.flags,
-                            name_len};
-      if (!stream_write_frame(conn->stream, msg_hdr, sizeof(msg_hdr),
-                              track_id.name, name_len))
+      if (!transport_stream_write_track_frame(
+              conn->stream, QLINQ_WIRE_SUBSCRIBE, alias, &track_id))
         return false;
     }
     return true;
@@ -3028,29 +2467,25 @@ bool transport_subscribe(transport_t *t, moq_track_id_t track_id) {
   }
 
   uint8_t alias;
-  if (find_alias_by_track(t->client_conn, &track_id, &alias) != 0) {
+  if (transport_subscriptions_find_alias(&t->client_conn->subscriptions,
+                                         &track_id, &alias) != 0) {
     if (track_id.name[0] == '\0') {
       alias = (uint8_t)track_id.type;
     } else {
-      int next_alias = 8;
-      for (int i = 0; i < 32; i++) {
-        if (t->client_conn->subscriptions[i].active &&
-            t->client_conn->subscriptions[i].alias >= next_alias) {
-          next_alias = t->client_conn->subscriptions[i].alias + 1;
-        }
-      }
+      int next_alias =
+          transport_subscriptions_next_alias(&t->client_conn->subscriptions, 8);
+      if (next_alias < 0)
+        return false;
       alias = (uint8_t)next_alias;
     }
-    if (!add_subscription(t->client_conn, track_id.type, track_id.flags,
-                          track_id.name, alias))
+    if (!transport_subscriptions_add(&t->client_conn->subscriptions,
+                                     track_id.type, track_id.flags,
+                                     track_id.name, alias))
       return false;
   }
 
-  uint8_t name_len = (uint8_t)strlen(track_id.name);
-  uint8_t msg_hdr[5] = {0x01, alias, (uint8_t)track_id.type, track_id.flags,
-                        name_len};
-  return stream_write_frame(t->client_conn->stream, msg_hdr, sizeof(msg_hdr),
-                            track_id.name, name_len);
+  return transport_stream_write_track_frame(
+      t->client_conn->stream, QLINQ_WIRE_SUBSCRIBE, alias, &track_id);
 }
 
 bool transport_request_keyframe(transport_t *t, moq_track_id_t track_id) {
@@ -3059,11 +2494,8 @@ bool transport_request_keyframe(transport_t *t, moq_track_id_t track_id) {
       !quicly_sendstate_is_open(&t->client_conn->stream->sendstate))
     return false;
 
-  uint8_t name_len = (uint8_t)strlen(track_id.name);
-  uint8_t msg_hdr[5] = {0x06, 0, (uint8_t)track_id.type, track_id.flags,
-                        name_len};
-  return stream_write_frame(t->client_conn->stream, msg_hdr, sizeof(msg_hdr),
-                            track_id.name, name_len);
+  return transport_stream_write_track_frame(
+      t->client_conn->stream, QLINQ_WIRE_KEYFRAME_REQUEST, 0, &track_id);
 }
 
 bool transport_send_unicast(transport_t *t, transport_conn_t *conn,
@@ -3074,12 +2506,8 @@ bool transport_send_unicast(transport_t *t, transport_conn_t *conn,
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
 
-  uint8_t hdr[5];
-  hdr[0] = 0x03;
-  uint32_t sz = htobe32((uint32_t)size);
-  memcpy(hdr + 1, &sz, 4);
-
-  return stream_write_frame(conn->stream, hdr, sizeof(hdr), data, size);
+  return transport_stream_write_frame(conn->stream, QLINQ_WIRE_UNICAST, data,
+                                      size);
 }
 
 void transport_close_conn(transport_t *t, transport_conn_t *conn) {
@@ -3100,12 +2528,8 @@ bool transport_send_auth(transport_t *t, transport_conn_t *conn,
   if (token_len > 65535 || (token_len > 0 && !token))
     return false;
 
-  uint8_t hdr[3];
-  hdr[0] = 0x04;
-  uint16_t t_len = htobe16((uint16_t)token_len);
-  memcpy(hdr + 1, &t_len, 2);
-
-  return stream_write_frame(conn->stream, hdr, sizeof(hdr), token, token_len);
+  return transport_stream_write_frame(conn->stream, QLINQ_WIRE_AUTH_REQUEST,
+                                      token, token_len);
 }
 
 bool transport_respond_auth(transport_t *t, transport_conn_t *conn,
@@ -3116,8 +2540,9 @@ bool transport_respond_auth(transport_t *t, transport_conn_t *conn,
       !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
 
-  uint8_t resp[2] = {0x05, success ? 1 : 0};
-  if (!stream_write_frame(conn->stream, resp, sizeof(resp), NULL, 0))
+  uint8_t status = success ? 1 : 0;
+  if (!transport_stream_write_frame(conn->stream, QLINQ_WIRE_AUTH_RESPONSE,
+                                    &status, sizeof(status)))
     return false;
 
   if (success) {
@@ -3182,7 +2607,8 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
       t->is_server ? (t->conn_count > 0 ? t->conns[0] : NULL) : t->client_conn;
   if (target && target->quic) {
     quicly_path_stats_t path_stats;
-    size_t mapped_path_idx = find_path_index_by_link(target->quic, t, path_idx);
+    size_t mapped_path_idx = transport_path_find_by_link(
+        target->quic, t->local_addrs, t->num_fds, path_idx);
     if (quicly_get_path_stats(target->quic, mapped_path_idx, &path_stats) ==
         0) {
       stats->sent = path_stats.sent;
@@ -3236,19 +2662,14 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
     if (!conn->authenticated)
       return false;
 
-    if (t->is_server && !is_subscribed(conn, track_id))
+    if (t->is_server &&
+        !transport_subscriptions_contains(&conn->subscriptions, track_id))
       continue;
 
     if (profile.reliable) {
-      quicly_stream_t *stream = NULL;
-      for (int i = 0; i < 32; i++) {
-        if (conn->subscriptions[i].active &&
-            conn->subscriptions[i].track_id.type == track_id->type &&
-            strcmp(conn->subscriptions[i].track_id.name, track_id->name) == 0) {
-          stream = conn->subscriptions[i].stream;
-          break;
-        }
-      }
+      const track_subscription_t *subscription =
+          transport_subscriptions_find_const(&conn->subscriptions, track_id);
+      quicly_stream_t *stream = subscription ? subscription->stream : NULL;
 
       if (stream) {
         quicly_streambuf_t *sbuf = (quicly_streambuf_t *)stream->data;
@@ -3258,7 +2679,7 @@ bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id) {
         }
       }
     } else {
-      for (size_t p = 0; p < QUICLY_MAX_FLAT_PATHS; p++) {
+      for (size_t p = 0; p < TRANSPORT_MAX_QUIC_PATHS; p++) {
         if (conn->queued_datagrams[p] >=
             QUICLY_PATH_DATAGRAM_QUEUE_CAPACITY * 3 / 4) {
           all_ready = false;

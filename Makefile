@@ -51,6 +51,13 @@ PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
 COMMON_OBJS = src/common/data_uds.o \
+              src/common/transport_fec_state.o \
+              src/common/transport_memory.o \
+              src/common/transport_paths.o \
+              src/common/transport_stream.o \
+              src/common/transport_subscriptions.o \
+              src/common/transport_tls.o \
+              src/common/transport_wire.o \
               src/common/transport_quicly.o \
               src/common/fec.o \
               deps/nanors/rs.o \
@@ -109,6 +116,12 @@ t/00util/test_tund: t/00util/test_tund.o $(COMMON_OBJS)
 t/00util/test_data_uds: t/00util/test_data_uds.o src/common/data_uds.o
 	$(CC) -o $@ t/00util/test_data_uds.o src/common/data_uds.o $(LDFLAGS)
 
+t/00util/test_transport_wire: t/00util/test_transport_wire.o src/common/transport_wire.o
+	$(CC) -o $@ t/00util/test_transport_wire.o src/common/transport_wire.o $(LDFLAGS)
+
+t/00util/test_transport_components: t/00util/test_transport_components.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_transport_components.o $(COMMON_OBJS) $(LDFLAGS)
+
 t/00util/test_benchmark: t/00util/test_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
 
@@ -131,10 +144,10 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
 clean: 
-	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 
-check: qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_multipath t/00util/test_multipath_nack gencerts
+check: qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack gencerts
 	prove -I. -v t/*.t
 
 t/assets/server.crt t/assets/server.key:

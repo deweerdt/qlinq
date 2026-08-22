@@ -1,0 +1,130 @@
+#ifndef QLINQ_TRANSPORT_WIRE_H
+#define QLINQ_TRANSPORT_WIRE_H
+
+#include <stdbool.h>
+#include <stddef.h>
+#include <stdint.h>
+
+#define QLINQ_WIRE_VERSION 1U
+#define QLINQ_WIRE_FRAME_HEADER_SIZE 8U
+#define QLINQ_WIRE_FEC_HEADER_SIZE 36U
+#define QLINQ_WIRE_TELEMETRY_SIZE 24U
+#define QLINQ_WIRE_MAX_TRACK_NAME 63U
+#define QLINQ_WIRE_MAX_NACK_SYMBOLS 1024U
+
+typedef enum {
+  QLINQ_WIRE_OK = 0,
+  QLINQ_WIRE_NEED_MORE,
+  QLINQ_WIRE_INVALID,
+  QLINQ_WIRE_UNSUPPORTED_VERSION,
+  QLINQ_WIRE_TOO_LARGE
+} qlinq_wire_result_t;
+
+typedef enum {
+  QLINQ_WIRE_SUBSCRIBE = 1,
+  QLINQ_WIRE_UNSUBSCRIBE = 2,
+  QLINQ_WIRE_UNICAST = 3,
+  QLINQ_WIRE_AUTH_REQUEST = 4,
+  QLINQ_WIRE_AUTH_RESPONSE = 5,
+  QLINQ_WIRE_KEYFRAME_REQUEST = 6,
+  QLINQ_WIRE_TRACK_OBJECT = 7,
+  QLINQ_WIRE_NACK = 8
+} qlinq_wire_frame_type_t;
+
+typedef enum {
+  QLINQ_WIRE_DATAGRAM_FEC = 1,
+  QLINQ_WIRE_DATAGRAM_TELEMETRY = 2
+} qlinq_wire_datagram_type_t;
+
+typedef struct {
+  uint8_t type;
+  const uint8_t *payload;
+  size_t payload_len;
+  size_t consumed;
+} qlinq_wire_frame_t;
+
+typedef struct {
+  uint8_t alias;
+  uint8_t track_type;
+  uint8_t flags;
+  char name[QLINQ_WIRE_MAX_TRACK_NAME + 1U];
+} qlinq_wire_track_t;
+
+typedef struct {
+  uint8_t alias;
+  uint32_t group_id;
+  uint32_t object_id;
+  uint16_t missing_count;
+  const uint8_t *encoded_indices;
+} qlinq_wire_nack_t;
+
+typedef struct {
+  uint8_t alias;
+  bool is_keyframe;
+  uint8_t priority;
+  uint8_t path_id;
+  uint32_t group_id;
+  uint32_t object_id;
+  uint16_t symbol_index;
+  uint16_t total_symbols;
+  uint16_t data_symbols;
+  uint16_t symbol_size;
+  uint32_t original_size;
+  uint64_t send_time_ns;
+} qlinq_wire_fec_header_t;
+
+typedef struct {
+  uint8_t path_id;
+  uint64_t send_time_ns;
+  uint64_t recv_time_ns;
+} qlinq_wire_telemetry_t;
+
+bool qlinq_wire_frame_type_is_known(uint8_t type);
+
+qlinq_wire_result_t
+qlinq_wire_encode_frame_header(uint8_t *dst, size_t capacity, uint8_t type,
+                               size_t payload_len, size_t max_payload_len);
+qlinq_wire_result_t qlinq_wire_encode_frame(uint8_t *dst, size_t capacity,
+                                            uint8_t type, const void *payload,
+                                            size_t payload_len,
+                                            size_t max_payload_len,
+                                            size_t *written);
+qlinq_wire_result_t qlinq_wire_decode_frame(const uint8_t *src, size_t len,
+                                            size_t max_payload_len,
+                                            qlinq_wire_frame_t *frame);
+
+qlinq_wire_result_t qlinq_wire_encode_track(uint8_t *dst, size_t capacity,
+                                            const qlinq_wire_track_t *track,
+                                            size_t *written);
+qlinq_wire_result_t qlinq_wire_decode_track(const uint8_t *src, size_t len,
+                                            qlinq_wire_track_t *track);
+
+qlinq_wire_result_t qlinq_wire_encode_nack(uint8_t *dst, size_t capacity,
+                                           uint8_t alias, uint32_t group_id,
+                                           uint32_t object_id,
+                                           const uint16_t *missing,
+                                           uint16_t missing_count,
+                                           size_t *written);
+qlinq_wire_result_t qlinq_wire_decode_nack(const uint8_t *src, size_t len,
+                                           qlinq_wire_nack_t *nack);
+bool qlinq_wire_nack_index(const qlinq_wire_nack_t *nack, size_t index,
+                           uint16_t *symbol_index);
+
+qlinq_wire_result_t
+qlinq_wire_encode_fec_header(uint8_t *dst, size_t capacity,
+                             const qlinq_wire_fec_header_t *header);
+qlinq_wire_result_t
+qlinq_wire_decode_fec_header(const uint8_t *src, size_t len,
+                             qlinq_wire_fec_header_t *header);
+
+qlinq_wire_result_t qlinq_wire_decode_datagram_type(const uint8_t *src,
+                                                    size_t len, uint8_t *type);
+
+qlinq_wire_result_t
+qlinq_wire_encode_telemetry(uint8_t *dst, size_t capacity,
+                            const qlinq_wire_telemetry_t *telemetry);
+qlinq_wire_result_t
+qlinq_wire_decode_telemetry(const uint8_t *src, size_t len,
+                            qlinq_wire_telemetry_t *telemetry);
+
+#endif
