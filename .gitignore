@@ -12,6 +12,7 @@ t/00util/test_tund
 t/00util/test_data_uds
 t/00util/test_transport_wire
 t/00util/test_transport_components
+t/00util/fuzz_transport_wire
 t/00util/test_benchmark
 t/00util/test_rateless_benchmark
 t/00util/test_tc_benchmark
@@ -19,6 +20,7 @@ t/00util/test_multipath
 t/00util/test_multipath_nack
 t/assets/
 *.o
+*.d
 *.a
 
 # CMake build directories
@@ -38,3 +40,6 @@ host_helpers/
 
 # Logs
 logs/
+crash-*
+examples/data_multipath_benchmark
+tmp/

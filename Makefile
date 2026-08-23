@@ -5,6 +5,7 @@ ARCH = $(shell uname -m)
 
 # Default CFLAGS for our code
 CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DPATHFLOW_ARENA_SIZE=65536
+DEPFLAGS = -MMD -MP
 
 # Include paths: use -isystem for quicly and picotls to suppress warning headers
 INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -Ideps/pathflow -Ideps/pathflow/solvers -isystem deps/quicly/include -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib
@@ -54,9 +55,12 @@ COMMON_OBJS = src/common/data_uds.o \
               src/common/transport_fec_state.o \
               src/common/transport_memory.o \
               src/common/transport_paths.o \
+              src/common/transport_repair.o \
+              src/common/transport_scheduler.o \
               src/common/transport_stream.o \
               src/common/transport_subscriptions.o \
               src/common/transport_tls.o \
+              src/common/transport_udp.o \
               src/common/transport_wire.o \
               src/common/transport_quicly.o \
               src/common/fec.o \
@@ -80,13 +84,13 @@ FEC_OBJS = src/common/fec.o \
 
 # Rules to compile our source files with full warnings
 src/%.o: src/%.c
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -c $< -o $@
 
 examples/%.o: examples/%.c
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -c $< -o $@
 
 t/%.o: t/%.c
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -c $< -o $@
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -c $< -o $@
 
 # Rule to compile third-party deps and suppress all warnings with -w
 deps/%.o: deps/%.c
@@ -122,6 +126,13 @@ t/00util/test_transport_wire: t/00util/test_transport_wire.o src/common/transpor
 t/00util/test_transport_components: t/00util/test_transport_components.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_transport_components.o $(COMMON_OBJS) $(LDFLAGS)
 
+t/00util/fuzz_transport_wire: t/00util/fuzz_transport_wire.c src/common/transport_wire.c
+	clang $(CFLAGS_COMMON) $(INCLUDES) -fsanitize=fuzzer,address,undefined \
+		-o $@ t/00util/fuzz_transport_wire.c src/common/transport_wire.c
+
+fuzz-wire: t/00util/fuzz_transport_wire
+	ASAN_OPTIONS=detect_leaks=0 ./t/00util/fuzz_transport_wire -runs=10000
+
 t/00util/test_benchmark: t/00util/test_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
 
@@ -144,13 +155,14 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
 clean: 
-	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
+	find src t examples -name "*.d" -delete
 
 check: qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack gencerts
 	prove -I. -v t/*.t
 
-t/assets/server.crt t/assets/server.key:
+t/assets/server.crt t/assets/server.key &:
 	mkdir -p t/assets
 	openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout t/assets/server.key -out t/assets/server.crt -subj "/CN=localhost"
 
@@ -159,4 +171,6 @@ gencerts: t/assets/server.crt t/assets/server.key
 indent:
 	clang-format -style=LLVM -i src/common/*.c src/common/*.h src/host/linux/*.c examples/*.c t/00util/*.c
 
-.PHONY: all clean check benchmark indent gencerts
+.PHONY: all clean check benchmark fuzz-wire indent gencerts
+
+-include $(shell find src t examples -name "*.d" -print 2>/dev/null)
