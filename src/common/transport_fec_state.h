@@ -12,8 +12,8 @@
 
 typedef struct {
   moq_track_id_t track_id;
-  uint32_t group_id;
-  uint32_t object_id;
+  uint64_t group_id;
+  uint64_t object_id;
   uint8_t *data;
   size_t size;
   uint8_t priority;
@@ -30,8 +30,8 @@ typedef struct {
 
 sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
                                                const moq_track_id_t *track,
-                                               uint32_t group_id,
-                                               uint32_t object_id);
+                                               uint64_t group_id,
+                                               uint64_t object_id);
 void transport_sent_cache_store(transport_sent_cache_t *cache,
                                 const moq_object_t *object,
                                 uint16_t total_symbols, uint16_t data_symbols,

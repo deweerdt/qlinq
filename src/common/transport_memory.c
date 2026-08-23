@@ -128,3 +128,18 @@ bool transport_assembler_grow(frame_assembler_t *assembler, uint16_t symbols,
   assembler->capacity_symbol_size = new_symbol_size;
   return true;
 }
+
+size_t transport_assembler_required_bytes(uint16_t symbols,
+                                          uint16_t symbol_size) {
+  if (symbols == 0 || symbol_size == 0)
+    return 0;
+  return (size_t)symbols * (sizeof(uint8_t *) + (size_t)symbol_size +
+                            2U * sizeof(bool) + sizeof(uint16_t));
+}
+
+size_t transport_assembler_capacity_bytes(const frame_assembler_t *assembler) {
+  if (!assembler)
+    return 0;
+  return transport_assembler_required_bytes(assembler->capacity_symbols,
+                                            assembler->capacity_symbol_size);
+}

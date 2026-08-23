@@ -16,8 +16,8 @@ static bool track_equal(const moq_track_id_t *a, const moq_track_id_t *b) {
 
 sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
                                                const moq_track_id_t *track,
-                                               uint32_t group_id,
-                                               uint32_t object_id) {
+                                               uint64_t group_id,
+                                               uint64_t object_id) {
   if (!cache || !track)
     return NULL;
   for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
@@ -43,8 +43,8 @@ void transport_sent_cache_store(transport_sent_cache_t *cache,
 
   free(entry->data);
   entry->track_id = object->track_id;
-  entry->group_id = (uint32_t)object->group_id;
-  entry->object_id = (uint32_t)object->object_id;
+  entry->group_id = object->group_id;
+  entry->object_id = object->object_id;
   entry->size = object->size;
   entry->priority = object->priority;
   entry->is_keyframe = object->is_keyframe;

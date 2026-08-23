@@ -22,8 +22,8 @@ void transport_arena_reset(arena_t *arena);
 
 typedef struct {
   uint8_t track_id;
-  uint32_t group_id;
-  uint32_t object_id;
+  uint64_t group_id;
+  uint64_t object_id;
   uint16_t total_symbols;
   uint16_t data_symbols;
   uint16_t symbol_size;
@@ -47,5 +47,8 @@ typedef struct {
 void transport_assembler_release(frame_assembler_t *assembler);
 bool transport_assembler_grow(frame_assembler_t *assembler, uint16_t symbols,
                               uint16_t symbol_size);
+size_t transport_assembler_capacity_bytes(const frame_assembler_t *assembler);
+size_t transport_assembler_required_bytes(uint16_t symbols,
+                                          uint16_t symbol_size);
 
 #endif

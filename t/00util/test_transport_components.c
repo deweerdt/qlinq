@@ -1,6 +1,8 @@
 #include "transport_fec_state.h"
 #include "transport_memory.h"
 #include "transport_paths.h"
+#include "transport_repair.h"
+#include "transport_scheduler.h"
 #include "transport_subscriptions.h"
 
 #include <stdio.h>
@@ -26,6 +28,9 @@ int main(void) {
 
   frame_assembler_t assembler = {0};
   CHECK(transport_assembler_grow(&assembler, 2, 8), "assembler allocation");
+  CHECK(transport_assembler_capacity_bytes(&assembler) ==
+            transport_assembler_required_bytes(2, 8),
+        "assembler memory accounting");
   memset(assembler.buffers[0], 0x5a, 8);
   assembler.received_mask[0] = true;
   assembler.total_symbols = 2;
@@ -70,6 +75,22 @@ int main(void) {
             transport_path_select_physical(paths, 3, 5) == 2,
         "physical path selection");
 
+  path_state_t path_states[2] = {
+      {.b_ewma = FP_FROM_INT(100), .l_ewma = FP_FROM_FLOAT(0.01f)},
+      {.b_ewma = FP_FROM_INT(50), .l_ewma = FP_FROM_FLOAT(0.02f)}};
+  pathflow_context_t scheduler_context = {0};
+  size_t round_robin = 0;
+  transport_schedule_t schedule;
+  CHECK(transport_schedule_build(&scheduler_context, NULL, path_states, 2, 5,
+                                 1100, false, 1, &round_robin, &schedule) &&
+            schedule.paths[0].x == 3 && schedule.paths[1].x == 2 &&
+            schedule.parity_symbols == 0,
+        "non-FEC schedule distribution");
+  CHECK(transport_schedule_build(&scheduler_context, NULL, path_states, 2, 1,
+                                 1100, true, 1, &round_robin, &schedule) &&
+            schedule.paths[0].x == 1 && round_robin == 1,
+        "single-symbol round robin schedule");
+
   const uint8_t object_data[] = {1, 2, 3, 4};
   moq_object_t object = {.track_id = track,
                          .group_id = 10,
@@ -78,11 +99,28 @@ int main(void) {
                          .size = sizeof(object_data),
                          .priority = 2};
   transport_sent_cache_t sent_cache = {0};
-  transport_sent_cache_store(&sent_cache, &object, 4, 3, 1200);
+  transport_sent_cache_store(&sent_cache, &object, 3, 2, 2);
   sent_object_cache_t *cached =
       transport_sent_cache_find(&sent_cache, &track, 10, 20);
   CHECK(cached && cached->size == sizeof(object_data) && cached->data[3] == 4,
         "sent-object cache roundtrip");
+
+  uint16_t missing_symbol = 1;
+  transport_repair_batch_t repair;
+  transport_fec_cache_t repair_fec_cache = {0};
+  CHECK(transport_repair_build(&repair_fec_cache, cached, false,
+                               &missing_symbol, 1, &repair),
+        "repair batch build");
+  CHECK(repair.count == 1 && repair.indices[0] == 1 &&
+            repair.symbols[0] == object_data[2],
+        "repair returns requested data symbol");
+  transport_repair_batch_destroy(&repair);
+  CHECK(transport_repair_build(&repair_fec_cache, cached, true, NULL, 0,
+                               &repair) &&
+            repair.count == cached->data_symbols,
+        "whole-object repair is bounded data retransmission");
+  transport_repair_batch_destroy(&repair);
+  transport_fec_cache_destroy(&repair_fec_cache);
   transport_sent_cache_destroy(&sent_cache);
 
   transport_fec_cache_t fec_cache = {0};
