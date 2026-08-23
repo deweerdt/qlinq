@@ -52,14 +52,19 @@ PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
 COMMON_OBJS = src/common/data_uds.o \
+              src/common/transport_config.o \
+              src/common/transport_egress.o \
               src/common/transport_fec_state.o \
               src/common/transport_memory.o \
               src/common/transport_paths.o \
+              src/common/transport_protocol.o \
+              src/common/transport_publish.o \
               src/common/transport_repair.o \
               src/common/transport_scheduler.o \
               src/common/transport_stream.o \
               src/common/transport_subscriptions.o \
               src/common/transport_tls.o \
+              src/common/transport_tracks.o \
               src/common/transport_udp.o \
               src/common/transport_wire.o \
               src/common/transport_quicly.o \

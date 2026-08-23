@@ -1,3 +1,5 @@
+#include "transport_config.h"
+#include "transport_egress.h"
 #include "transport_fec_state.h"
 #include "transport_memory.h"
 #include "transport_paths.h"
@@ -17,6 +19,29 @@
   } while (0)
 
 int main(void) {
+  transport_limits_t configured = {0};
+  transport_limits_t resolved_limits;
+  char limit_error[128];
+  CHECK(transport_limits_resolve(&configured, &resolved_limits, limit_error,
+                                 sizeof(limit_error)),
+        "default limit resolution");
+  CHECK(resolved_limits.max_connections == TRANSPORT_DEFAULT_MAX_CONNECTIONS &&
+            resolved_limits.max_subscriptions_per_connection ==
+                TRANSPORT_DEFAULT_MAX_SUBSCRIPTIONS &&
+            resolved_limits.max_udp_payload_size == 1280,
+        "default limits");
+  configured.max_egress_packets_per_socket = 63;
+  CHECK(!transport_limits_resolve(&configured, &resolved_limits, limit_error,
+                                  sizeof(limit_error)),
+        "unsafe egress limit rejection");
+
+  transport_egress_t egress;
+  CHECK(transport_egress_init(&egress, 64, 64U * 1500U), "egress init");
+  CHECK(transport_egress_can_accept(&egress, 64, 64U * 1500U) &&
+            !transport_egress_can_accept(&egress, 65, 64U * 1500U),
+        "egress reservation bounds");
+  transport_egress_destroy(&egress);
+
   arena_t arena;
   CHECK(transport_arena_init(&arena, 64), "arena init");
   CHECK(transport_arena_alloc(&arena, 16) != NULL, "arena allocation");
@@ -68,6 +93,19 @@ int main(void) {
   transport_subscriptions_remove(&subscriptions, track.type, track.name);
   CHECK(!transport_subscriptions_contains(&subscriptions, &track),
         "subscription removal");
+  transport_subscriptions_destroy(&subscriptions);
+
+  transport_subscription_table_t bounded_subscriptions = {0};
+  CHECK(transport_subscriptions_init(&bounded_subscriptions, 1),
+        "bounded subscription init");
+  CHECK(transport_subscriptions_add(&bounded_subscriptions, MOQ_TRACK_DATA, 0,
+                                    "one", 8) &&
+            !transport_subscriptions_add(&bounded_subscriptions, MOQ_TRACK_DATA,
+                                         0, "alias-collision", 8) &&
+            !transport_subscriptions_add(&bounded_subscriptions, MOQ_TRACK_DATA,
+                                         0, "two", 9),
+        "subscription capacity");
+  transport_subscriptions_destroy(&bounded_subscriptions);
 
   path_t paths[3] = {{.x = 2}, {.x = 1}, {.x = 3}};
   CHECK(transport_path_select_physical(paths, 3, 0) == 0 &&
