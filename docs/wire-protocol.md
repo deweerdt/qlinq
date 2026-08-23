@@ -22,8 +22,9 @@ Control messages and reliable track objects use one common envelope:
 | 8 | variable | Frame payload |
 
 The receiver buffers incomplete frames and rejects unknown frame types or
-payloads above the configured limit. The maximum reliable object is 1 MiB; a
-track-object payload has a 20-byte metadata header followed by application data.
+payloads above the configured limit. The reliable-object implementation ceiling
+is approximately 1 MiB and may be configured lower; a track-object payload has
+a 20-byte metadata header followed by application data.
 
 | Type | Name | Payload |
 | ---: | --- | --- |
@@ -35,6 +36,32 @@ track-object payload has a 20-byte metadata header followed by application data.
 | 6 | Keyframe request | Track descriptor |
 | 7 | Reliable track object | Object metadata followed by object bytes |
 | 8 | NACK | NACK descriptor |
+| 9 | HELLO | Capability and resource-limit advertisement |
+
+`HELLO` is the first frame on the bidirectional control stream in each
+direction. Application control frames and the public connected event are gated
+until both peers have exchanged valid HELLO frames. This is still protocol
+version 1: the handshake was added before version 1 had external users.
+
+The HELLO payload is 20 bytes:
+
+| Offset | Size | Field |
+| ---: | ---: | --- |
+| 0 | 1 | Role: client `0`, server `1` |
+| 1 | 1 | Reserved zero byte |
+| 2 | 2 | Maximum paths |
+| 4 | 4 | Capability flags |
+| 8 | 4 | Maximum reliable-object bytes |
+| 12 | 4 | Maximum FEC-object bytes |
+| 16 | 2 | Maximum subscriptions |
+| 18 | 2 | Maximum UDP payload bytes |
+
+Defined capabilities are reliable objects (`0x01`), datagrams (`0x02`),
+Reed-Solomon FEC (`0x04`), rateless FEC (`0x08`), multipath (`0x10`), and
+application authentication (`0x20`). Unknown capability bits, duplicate HELLO
+frames, a peer with the wrong role, or an application frame before HELLO are
+protocol errors. Each connection uses the lower local/peer object,
+subscription, and UDP-payload limits.
 
 A track descriptor contains alias, track type, flags, one-byte name length,
 and up to 63 name bytes. A NACK descriptor contains alias, a flags byte,

@@ -10,6 +10,7 @@
 #define QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE 20U
 #define QLINQ_WIRE_FEC_HEADER_SIZE 44U
 #define QLINQ_WIRE_TELEMETRY_SIZE 24U
+#define QLINQ_WIRE_HELLO_SIZE 20U
 #define QLINQ_WIRE_MAX_TRACK_NAME 63U
 #define QLINQ_WIRE_MAX_NACK_SYMBOLS 1024U
 #define QLINQ_WIRE_NACK_WHOLE_OBJECT 0x01U
@@ -30,8 +31,23 @@ typedef enum {
   QLINQ_WIRE_AUTH_RESPONSE = 5,
   QLINQ_WIRE_KEYFRAME_REQUEST = 6,
   QLINQ_WIRE_TRACK_OBJECT = 7,
-  QLINQ_WIRE_NACK = 8
+  QLINQ_WIRE_NACK = 8,
+  QLINQ_WIRE_HELLO = 9
 } qlinq_wire_frame_type_t;
+
+#define QLINQ_WIRE_ROLE_CLIENT 0U
+#define QLINQ_WIRE_ROLE_SERVER 1U
+
+#define QLINQ_WIRE_CAP_RELIABLE 0x00000001U
+#define QLINQ_WIRE_CAP_DATAGRAM 0x00000002U
+#define QLINQ_WIRE_CAP_FEC_REED_SOLOMON 0x00000004U
+#define QLINQ_WIRE_CAP_FEC_RATELESS 0x00000008U
+#define QLINQ_WIRE_CAP_MULTIPATH 0x00000010U
+#define QLINQ_WIRE_CAP_AUTHENTICATION 0x00000020U
+#define QLINQ_WIRE_CAP_KNOWN                                                   \
+  (QLINQ_WIRE_CAP_RELIABLE | QLINQ_WIRE_CAP_DATAGRAM |                         \
+   QLINQ_WIRE_CAP_FEC_REED_SOLOMON | QLINQ_WIRE_CAP_FEC_RATELESS |             \
+   QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION)
 
 typedef enum {
   QLINQ_WIRE_DATAGRAM_FEC = 1,
@@ -90,6 +106,16 @@ typedef struct {
   uint64_t recv_time_ns;
 } qlinq_wire_telemetry_t;
 
+typedef struct {
+  uint8_t role;
+  uint16_t max_paths;
+  uint32_t capabilities;
+  uint32_t max_reliable_object_size;
+  uint32_t max_fec_object_size;
+  uint16_t max_subscriptions;
+  uint16_t max_datagram_size;
+} qlinq_wire_hello_t;
+
 bool qlinq_wire_frame_type_is_known(uint8_t type);
 
 qlinq_wire_result_t
@@ -144,5 +170,10 @@ qlinq_wire_encode_telemetry(uint8_t *dst, size_t capacity,
 qlinq_wire_result_t
 qlinq_wire_decode_telemetry(const uint8_t *src, size_t len,
                             qlinq_wire_telemetry_t *telemetry);
+
+qlinq_wire_result_t qlinq_wire_encode_hello(uint8_t *dst, size_t capacity,
+                                            const qlinq_wire_hello_t *hello);
+qlinq_wire_result_t qlinq_wire_decode_hello(const uint8_t *src, size_t len,
+                                            qlinq_wire_hello_t *hello);
 
 #endif

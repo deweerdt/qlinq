@@ -53,7 +53,7 @@ static qlinq_wire_result_t check_envelope(const uint8_t *src, size_t len,
 }
 
 bool qlinq_wire_frame_type_is_known(uint8_t type) {
-  return type >= QLINQ_WIRE_SUBSCRIBE && type <= QLINQ_WIRE_NACK;
+  return type >= QLINQ_WIRE_SUBSCRIBE && type <= QLINQ_WIRE_HELLO;
 }
 
 qlinq_wire_result_t
@@ -361,5 +361,45 @@ qlinq_wire_decode_telemetry(const uint8_t *src, size_t len,
   telemetry->path_id = src[4];
   telemetry->send_time_ns = read_u64(src + 8);
   telemetry->recv_time_ns = read_u64(src + 16);
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t qlinq_wire_encode_hello(uint8_t *dst, size_t capacity,
+                                            const qlinq_wire_hello_t *hello) {
+  if (!dst || !hello || capacity < QLINQ_WIRE_HELLO_SIZE ||
+      hello->role > QLINQ_WIRE_ROLE_SERVER || hello->max_paths == 0 ||
+      hello->max_subscriptions == 0 || hello->max_datagram_size == 0 ||
+      hello->max_reliable_object_size == 0 || hello->max_fec_object_size == 0 ||
+      (hello->capabilities & ~QLINQ_WIRE_CAP_KNOWN) != 0)
+    return QLINQ_WIRE_INVALID;
+
+  dst[0] = hello->role;
+  dst[1] = 0;
+  write_u16(dst + 2, hello->max_paths);
+  write_u32(dst + 4, hello->capabilities);
+  write_u32(dst + 8, hello->max_reliable_object_size);
+  write_u32(dst + 12, hello->max_fec_object_size);
+  write_u16(dst + 16, hello->max_subscriptions);
+  write_u16(dst + 18, hello->max_datagram_size);
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t qlinq_wire_decode_hello(const uint8_t *src, size_t len,
+                                            qlinq_wire_hello_t *hello) {
+  if (!src || !hello || len != QLINQ_WIRE_HELLO_SIZE || src[1] != 0)
+    return QLINQ_WIRE_INVALID;
+  memset(hello, 0, sizeof(*hello));
+  hello->role = src[0];
+  hello->max_paths = read_u16(src + 2);
+  hello->capabilities = read_u32(src + 4);
+  hello->max_reliable_object_size = read_u32(src + 8);
+  hello->max_fec_object_size = read_u32(src + 12);
+  hello->max_subscriptions = read_u16(src + 16);
+  hello->max_datagram_size = read_u16(src + 18);
+  if (hello->role > QLINQ_WIRE_ROLE_SERVER || hello->max_paths == 0 ||
+      hello->max_subscriptions == 0 || hello->max_datagram_size == 0 ||
+      hello->max_reliable_object_size == 0 || hello->max_fec_object_size == 0 ||
+      (hello->capabilities & ~QLINQ_WIRE_CAP_KNOWN) != 0)
+    return QLINQ_WIRE_INVALID;
   return QLINQ_WIRE_OK;
 }

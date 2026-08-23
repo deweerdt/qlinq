@@ -222,6 +222,48 @@ int main(void) {
             QLINQ_WIRE_NEED_MORE,
         "partial datagram envelope");
 
+  qlinq_wire_hello_t hello = {.role = QLINQ_WIRE_ROLE_CLIENT,
+                              .max_paths = 4,
+                              .capabilities = QLINQ_WIRE_CAP_RELIABLE |
+                                              QLINQ_WIRE_CAP_DATAGRAM |
+                                              QLINQ_WIRE_CAP_FEC_RATELESS,
+                              .max_reliable_object_size = 1024U * 1024U - 16U,
+                              .max_fec_object_size = 1024U * 1024U,
+                              .max_subscriptions = 32,
+                              .max_datagram_size = 1500};
+  CHECK(qlinq_wire_encode_hello(payload, sizeof(payload), &hello) ==
+            QLINQ_WIRE_OK,
+        "hello encode");
+  qlinq_wire_hello_t decoded_hello;
+  CHECK(qlinq_wire_decode_hello(payload, QLINQ_WIRE_HELLO_SIZE,
+                                &decoded_hello) == QLINQ_WIRE_OK,
+        "hello decode");
+  CHECK(decoded_hello.role == hello.role &&
+            decoded_hello.max_paths == hello.max_paths &&
+            decoded_hello.capabilities == hello.capabilities &&
+            decoded_hello.max_reliable_object_size ==
+                hello.max_reliable_object_size &&
+            decoded_hello.max_fec_object_size == hello.max_fec_object_size &&
+            decoded_hello.max_subscriptions == hello.max_subscriptions &&
+            decoded_hello.max_datagram_size == hello.max_datagram_size,
+        "hello roundtrip");
+  CHECK(qlinq_wire_encode_frame(frame_buf, sizeof(frame_buf), QLINQ_WIRE_HELLO,
+                                payload, QLINQ_WIRE_HELLO_SIZE, sizeof(payload),
+                                &frame_len) == QLINQ_WIRE_OK &&
+            qlinq_wire_decode_frame(frame_buf, frame_len, sizeof(payload),
+                                    &frame) == QLINQ_WIRE_OK &&
+            frame.type == QLINQ_WIRE_HELLO,
+        "hello frame");
+  payload[1] = 1;
+  CHECK(qlinq_wire_decode_hello(payload, QLINQ_WIRE_HELLO_SIZE,
+                                &decoded_hello) == QLINQ_WIRE_INVALID,
+        "hello reserved byte");
+  payload[1] = 0;
+  payload[0] = 2;
+  CHECK(qlinq_wire_decode_hello(payload, QLINQ_WIRE_HELLO_SIZE,
+                                &decoded_hello) == QLINQ_WIRE_INVALID,
+        "hello role validation");
+
   printf("===TRANSPORT WIRE OK===\n");
   return 0;
 }
