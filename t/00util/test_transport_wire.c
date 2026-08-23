@@ -81,36 +81,82 @@ int main(void) {
         "track length mismatch");
 
   const uint16_t missing[] = {1, 7, 1023};
-  CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 13, 42, 99, missing, 3,
+  const uint64_t large_group_id = UINT64_C(0x12345678abcdef01);
+  const uint64_t large_object_id = UINT64_C(0xfedcba9876543210);
+  CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 13, 0, large_group_id,
+                               large_object_id, missing, 3,
                                &payload_len) == QLINQ_WIRE_OK,
         "nack encode");
   qlinq_wire_nack_t nack;
   CHECK(qlinq_wire_decode_nack(payload, payload_len, &nack) == QLINQ_WIRE_OK,
         "nack decode");
-  CHECK(nack.alias == 13 && nack.group_id == 42 && nack.object_id == 99 &&
-            nack.missing_count == 3,
+  CHECK(nack.alias == 13 && nack.flags == 0 &&
+            nack.group_id == large_group_id &&
+            nack.object_id == large_object_id && nack.missing_count == 3,
         "nack metadata");
   for (size_t i = 0; i < 3; i++) {
     uint16_t index = 0;
     CHECK(qlinq_wire_nack_index(&nack, i, &index) && index == missing[i],
           "nack index roundtrip");
   }
-  payload[1] = 1;
+  payload[1] = 2;
   CHECK(qlinq_wire_decode_nack(payload, payload_len, &nack) ==
             QLINQ_WIRE_INVALID,
         "nack reserved byte");
   payload[1] = 0;
-  payload[11] = 4;
+  payload[19] = 4;
   CHECK(qlinq_wire_decode_nack(payload, payload_len, &nack) ==
             QLINQ_WIRE_INVALID,
         "nack count mismatch");
+  CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 13,
+                               QLINQ_WIRE_NACK_WHOLE_OBJECT, large_group_id,
+                               large_object_id, NULL, 0,
+                               &payload_len) == QLINQ_WIRE_OK &&
+            qlinq_wire_decode_nack(payload, payload_len, &nack) ==
+                QLINQ_WIRE_OK &&
+            nack.flags == QLINQ_WIRE_NACK_WHOLE_OBJECT &&
+            nack.missing_count == 0,
+        "whole-object nack roundtrip");
+
+  qlinq_wire_track_object_t track_object = {.alias = 17,
+                                            .is_keyframe = true,
+                                            .priority = 2,
+                                            .group_id = large_group_id,
+                                            .object_id = large_object_id};
+  const uint8_t object_bytes[] = {4, 3, 2, 1};
+  CHECK(qlinq_wire_encode_track_object(payload, sizeof(payload),
+                                       &track_object) == QLINQ_WIRE_OK,
+        "track object encode");
+  memcpy(payload + QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE, object_bytes,
+         sizeof(object_bytes));
+  qlinq_wire_track_object_t decoded_object;
+  const uint8_t *decoded_payload = NULL;
+  size_t decoded_payload_len = 0;
+  CHECK(qlinq_wire_decode_track_object(
+            payload, QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE + sizeof(object_bytes),
+            &decoded_object, &decoded_payload,
+            &decoded_payload_len) == QLINQ_WIRE_OK,
+        "track object decode");
+  CHECK(decoded_object.alias == track_object.alias &&
+            decoded_object.is_keyframe == track_object.is_keyframe &&
+            decoded_object.priority == track_object.priority &&
+            decoded_object.group_id == large_group_id &&
+            decoded_object.object_id == large_object_id &&
+            decoded_payload_len == sizeof(object_bytes) &&
+            memcmp(decoded_payload, object_bytes, sizeof(object_bytes)) == 0,
+        "track object roundtrip");
+  payload[3] = 1;
+  CHECK(qlinq_wire_decode_track_object(
+            payload, QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE, &decoded_object,
+            &decoded_payload, &decoded_payload_len) == QLINQ_WIRE_INVALID,
+        "track object reserved byte");
 
   qlinq_wire_fec_header_t fec = {.alias = 12,
                                  .is_keyframe = true,
                                  .priority = 2,
                                  .path_id = 3,
-                                 .group_id = 123,
-                                 .object_id = 456,
+                                 .group_id = large_group_id,
+                                 .object_id = large_object_id,
                                  .symbol_index = 7,
                                  .total_symbols = 20,
                                  .data_symbols = 16,

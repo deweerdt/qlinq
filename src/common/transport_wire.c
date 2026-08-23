@@ -179,44 +179,50 @@ qlinq_wire_result_t qlinq_wire_decode_track(const uint8_t *src, size_t len,
   return QLINQ_WIRE_OK;
 }
 
-qlinq_wire_result_t qlinq_wire_encode_nack(uint8_t *dst, size_t capacity,
-                                           uint8_t alias, uint32_t group_id,
-                                           uint32_t object_id,
-                                           const uint16_t *missing,
-                                           uint16_t missing_count,
-                                           size_t *written) {
-  if (!dst || !written || (missing_count > 0 && !missing))
+qlinq_wire_result_t
+qlinq_wire_encode_nack(uint8_t *dst, size_t capacity, uint8_t alias,
+                       uint8_t flags, uint64_t group_id, uint64_t object_id,
+                       const uint16_t *missing, uint16_t missing_count,
+                       size_t *written) {
+  if (!dst || !written || (flags & ~QLINQ_WIRE_NACK_WHOLE_OBJECT) != 0 ||
+      ((flags & QLINQ_WIRE_NACK_WHOLE_OBJECT) != 0
+           ? missing_count != 0
+           : (missing_count == 0 || !missing)))
     return QLINQ_WIRE_INVALID;
   if (missing_count > QLINQ_WIRE_MAX_NACK_SYMBOLS)
     return QLINQ_WIRE_TOO_LARGE;
-  size_t needed = 12U + (size_t)missing_count * 2U;
+  size_t needed = 20U + (size_t)missing_count * 2U;
   if (capacity < needed)
     return QLINQ_WIRE_TOO_LARGE;
   dst[0] = alias;
-  dst[1] = 0;
-  write_u32(dst + 2, group_id);
-  write_u32(dst + 6, object_id);
-  write_u16(dst + 10, missing_count);
+  dst[1] = flags;
+  write_u64(dst + 2, group_id);
+  write_u64(dst + 10, object_id);
+  write_u16(dst + 18, missing_count);
   for (size_t i = 0; i < missing_count; i++)
-    write_u16(dst + 12 + i * 2, missing[i]);
+    write_u16(dst + 20 + i * 2, missing[i]);
   *written = needed;
   return QLINQ_WIRE_OK;
 }
 
 qlinq_wire_result_t qlinq_wire_decode_nack(const uint8_t *src, size_t len,
                                            qlinq_wire_nack_t *nack) {
-  if (!src || !nack || len < 12 || src[1] != 0)
+  if (!src || !nack || len < 20 ||
+      (src[1] & ~QLINQ_WIRE_NACK_WHOLE_OBJECT) != 0)
     return QLINQ_WIRE_INVALID;
-  uint16_t count = read_u16(src + 10);
+  uint16_t count = read_u16(src + 18);
   if (count > QLINQ_WIRE_MAX_NACK_SYMBOLS)
     return QLINQ_WIRE_TOO_LARGE;
-  if (len != 12U + (size_t)count * 2U)
+  if ((src[1] & QLINQ_WIRE_NACK_WHOLE_OBJECT) != 0 ? count != 0 : count == 0)
+    return QLINQ_WIRE_INVALID;
+  if (len != 20U + (size_t)count * 2U)
     return QLINQ_WIRE_INVALID;
   nack->alias = src[0];
-  nack->group_id = read_u32(src + 2);
-  nack->object_id = read_u32(src + 6);
+  nack->flags = src[1];
+  nack->group_id = read_u64(src + 2);
+  nack->object_id = read_u64(src + 10);
   nack->missing_count = count;
-  nack->encoded_indices = src + 12;
+  nack->encoded_indices = src + 20;
   return QLINQ_WIRE_OK;
 }
 
@@ -227,6 +233,42 @@ bool qlinq_wire_nack_index(const qlinq_wire_nack_t *nack, size_t index,
     return false;
   *symbol_index = read_u16(nack->encoded_indices + index * 2U);
   return true;
+}
+
+qlinq_wire_result_t
+qlinq_wire_encode_track_object(uint8_t *dst, size_t capacity,
+                               const qlinq_wire_track_object_t *object) {
+  if (!dst || !object)
+    return QLINQ_WIRE_INVALID;
+  if (capacity < QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE)
+    return QLINQ_WIRE_TOO_LARGE;
+  dst[0] = object->alias;
+  dst[1] = object->is_keyframe ? 1U : 0U;
+  dst[2] = object->priority;
+  dst[3] = 0;
+  write_u64(dst + 4, object->group_id);
+  write_u64(dst + 12, object->object_id);
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t
+qlinq_wire_decode_track_object(const uint8_t *src, size_t len,
+                               qlinq_wire_track_object_t *object,
+                               const uint8_t **payload, size_t *payload_len) {
+  if (!src || !object || !payload || !payload_len)
+    return QLINQ_WIRE_INVALID;
+  if (len < QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE)
+    return QLINQ_WIRE_INVALID;
+  if (src[1] > 1 || src[3] != 0)
+    return QLINQ_WIRE_INVALID;
+  object->alias = src[0];
+  object->is_keyframe = src[1] != 0;
+  object->priority = src[2];
+  object->group_id = read_u64(src + 4);
+  object->object_id = read_u64(src + 12);
+  *payload = src + QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE;
+  *payload_len = len - QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE;
+  return QLINQ_WIRE_OK;
 }
 
 qlinq_wire_result_t
@@ -244,14 +286,14 @@ qlinq_wire_encode_fec_header(uint8_t *dst, size_t capacity,
   dst[5] = header->is_keyframe ? 1U : 0U;
   dst[6] = header->priority;
   dst[7] = header->path_id;
-  write_u32(dst + 8, header->group_id);
-  write_u32(dst + 12, header->object_id);
-  write_u16(dst + 16, header->symbol_index);
-  write_u16(dst + 18, header->total_symbols);
-  write_u16(dst + 20, header->data_symbols);
-  write_u16(dst + 22, header->symbol_size);
-  write_u32(dst + 24, header->original_size);
-  write_u64(dst + 28, header->send_time_ns);
+  write_u64(dst + 8, header->group_id);
+  write_u64(dst + 16, header->object_id);
+  write_u16(dst + 24, header->symbol_index);
+  write_u16(dst + 26, header->total_symbols);
+  write_u16(dst + 28, header->data_symbols);
+  write_u16(dst + 30, header->symbol_size);
+  write_u32(dst + 32, header->original_size);
+  write_u64(dst + 36, header->send_time_ns);
   return QLINQ_WIRE_OK;
 }
 
@@ -272,14 +314,14 @@ qlinq_wire_decode_fec_header(const uint8_t *src, size_t len,
   header->is_keyframe = src[5] != 0;
   header->priority = src[6];
   header->path_id = src[7];
-  header->group_id = read_u32(src + 8);
-  header->object_id = read_u32(src + 12);
-  header->symbol_index = read_u16(src + 16);
-  header->total_symbols = read_u16(src + 18);
-  header->data_symbols = read_u16(src + 20);
-  header->symbol_size = read_u16(src + 22);
-  header->original_size = read_u32(src + 24);
-  header->send_time_ns = read_u64(src + 28);
+  header->group_id = read_u64(src + 8);
+  header->object_id = read_u64(src + 16);
+  header->symbol_index = read_u16(src + 24);
+  header->total_symbols = read_u16(src + 26);
+  header->data_symbols = read_u16(src + 28);
+  header->symbol_size = read_u16(src + 30);
+  header->original_size = read_u32(src + 32);
+  header->send_time_ns = read_u64(src + 36);
   return QLINQ_WIRE_OK;
 }
 
