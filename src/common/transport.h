@@ -38,26 +38,6 @@ typedef struct {
   char name[64];
 } moq_track_id_t;
 
-typedef enum {
-  MOQ_CTRL_MSG_NACK = 0x01,
-  MOQ_CTRL_MSG_ACK = 0x02,
-} moq_ctrl_msg_type_t;
-
-/* NACK control message struct */
-typedef struct __attribute__((packed)) {
-  uint8_t msg_type;
-  moq_track_id_t track_id;
-  uint64_t group_id;
-  uint16_t missing_count;
-} moq_nack_msg_t;
-
-/* ACK control message struct */
-typedef struct __attribute__((packed)) {
-  uint8_t msg_type;
-  moq_track_id_t track_id;
-  uint64_t group_id;
-} moq_ack_msg_t;
-
 /* represents an object (e.g. video frame or audio chunk) */
 typedef struct {
   moq_track_id_t track_id;
@@ -94,6 +74,9 @@ typedef struct {
   } auth; /* valid for auth events */
 } transport_event_t;
 
+/* Pointers inside an event, including object.data and auth.token, are borrowed
+ * and remain valid only for the duration of the callback. */
+
 /* callback for receiving transport events */
 typedef void (*transport_callback_t)(void *user_data,
                                      const transport_event_t *event);
@@ -103,6 +86,10 @@ typedef void (*transport_callback_t)(void *user_data,
 /* Wire and flow-control limits enforced by the transport. */
 #define TRANSPORT_MAX_RELIABLE_OBJECT_SIZE ((1024U * 1024U) - 16U)
 #define TRANSPORT_MAX_FEC_RECORD_SIZE UINT16_MAX
+
+#define TRANSPORT_APP_ERROR_PROTOCOL 0x100U
+#define TRANSPORT_APP_ERROR_AUTHENTICATION 0x101U
+#define TRANSPORT_APP_ERROR_RESOURCE_LIMIT 0x102U
 
 typedef struct {
   const char *bind_hosts[TRANSPORT_MAX_PATHS];
@@ -129,8 +116,23 @@ void transport_destroy(transport_t *t);
 /* drive the event loop and process timers */
 void transport_tick(transport_t *t);
 
-/* publish an object to all subscribers of a track (handles flexicast
- * distribution) */
+typedef enum {
+  TRANSPORT_PUBLISH_DELIVERED,
+  TRANSPORT_PUBLISH_BUFFERED,
+  TRANSPORT_PUBLISH_NO_RECIPIENTS,
+  TRANSPORT_PUBLISH_PARTIAL,
+  TRANSPORT_PUBLISH_BACKPRESSURE,
+  TRANSPORT_PUBLISH_INVALID,
+  TRANSPORT_PUBLISH_ERROR
+} transport_publish_result_t;
+
+/* Detailed publication result. PARTIAL means at least one eligible peer was
+ * queued successfully and at least one failed. */
+transport_publish_result_t transport_publish_ex(transport_t *t,
+                                                const moq_object_t *obj);
+
+/* Compatibility wrapper: true only when the object was delivered, buffered,
+ * or had no eligible recipients. */
 bool transport_publish(transport_t *t, const moq_object_t *obj);
 
 /* subscribe to a media track (client-side) */
@@ -173,6 +175,14 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
 
 /* mock a local IP interface addition for testing multipath */
 void transport_mock_iface_add(transport_t *t, const char *ip_addr);
+
+/* Deterministic path controls for integration tests. The override remains in
+ * effect for the lifetime of the current connections. */
+bool transport_mock_path_state(transport_t *t, size_t path_idx,
+                               uint32_t packets_per_second, double latency_ms,
+                               double loss_rate);
+
+size_t transport_get_datagram_symbol_size(const transport_t *t);
 
 /* check if a track is ready for more data (application-layer backpressure) */
 bool transport_is_track_ready(transport_t *t, const moq_track_id_t *track_id);

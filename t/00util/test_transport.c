@@ -17,6 +17,11 @@ typedef struct {
   int data_subscriptions;
   bool data_a_received;
   bool data_b_received;
+  uint64_t catalog_group_id;
+  uint64_t catalog_object_id;
+  uint8_t catalog_priority;
+  uint64_t video_group_id;
+  uint64_t video_object_id;
 } test_state_t;
 
 static void on_server_event(void *user_data, const transport_event_t *event) {
@@ -31,11 +36,12 @@ static void on_server_event(void *user_data, const transport_event_t *event) {
       /* serialize catalog manifest */
       const char *manifest = "video:fec:video_track\ndata:fec:data_track\n";
       moq_object_t cat_obj = {.track_id = event->track_id,
-                              .group_id = 0,
-                              .object_id = 0,
+                              .group_id = UINT64_C(0x12345678abcdef01),
+                              .object_id = UINT64_C(0xfedcba9876543210),
                               .data = (const uint8_t *)manifest,
                               .size = strlen(manifest),
-                              .is_keyframe = true};
+                              .is_keyframe = true,
+                              .priority = 2};
       transport_publish(state->transport, &cat_obj);
     } else if (event->track_id.type == MOQ_TRACK_VIDEO &&
                strcmp(event->track_id.name, "video_track") == 0) {
@@ -72,6 +78,9 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
   case TRANSPORT_EVENT_OBJECT:
     if (event->track_id.type == MOQ_TRACK_TEXT &&
         strcmp(event->track_id.name, "catalog") == 0) {
+      state->catalog_group_id = event->object.group_id;
+      state->catalog_object_id = event->object.object_id;
+      state->catalog_priority = event->object.priority;
       char manifest[256];
       if (event->object.size < sizeof(manifest)) {
         memcpy(manifest, event->object.data, event->object.size);
@@ -128,6 +137,8 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
     } else if (event->track_id.type == MOQ_TRACK_VIDEO &&
                strcmp(event->track_id.name, "video_track") == 0) {
       state->object_received = true;
+      state->video_group_id = event->object.group_id;
+      state->video_object_id = event->object.object_id;
       state->received_size = event->object.size;
       if (event->object.size < sizeof(state->received_data)) {
         memcpy(state->received_data, event->object.data, event->object.size);
@@ -201,6 +212,19 @@ int main(void) {
   }
   server_state.transport = server;
 
+  const uint8_t no_peer_data[] = {0};
+  moq_object_t no_peer_object = {.track_id = {.type = MOQ_TRACK_TEXT,
+                                              .flags = MOQ_TRACK_FLAG_RELIABLE,
+                                              .name = "no-peer"},
+                                 .data = no_peer_data,
+                                 .size = sizeof(no_peer_data)};
+  if (transport_publish_ex(server, &no_peer_object) !=
+      TRANSPORT_PUBLISH_NO_RECIPIENTS) {
+    fprintf(stderr, "no-recipient publication result was not explicit\n");
+    transport_destroy(server);
+    return 1;
+  }
+
   transport_t *client = transport_create(&client_cfg);
   if (!client) {
     fprintf(stderr, "failed to create client transport\n");
@@ -254,6 +278,14 @@ int main(void) {
     transport_destroy(server);
     return 1;
   }
+  if (client_state.catalog_group_id != UINT64_C(0x12345678abcdef01) ||
+      client_state.catalog_object_id != UINT64_C(0xfedcba9876543210) ||
+      client_state.catalog_priority != 2) {
+    fprintf(stderr, "reliable object metadata was not preserved\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
 
   /* server publishes test media frame on the dynamically discovered track */
   printf("publishing video frame on dynamically discovered track...\n");
@@ -261,8 +293,8 @@ int main(void) {
   moq_object_t obj = {.track_id = {.type = MOQ_TRACK_VIDEO,
                                    .flags = MOQ_TRACK_FLAG_FEC_ENABLED,
                                    .name = "video_track"},
-                      .group_id = 42,
-                      .object_id = 1,
+                      .group_id = UINT64_C(0x10000002a),
+                      .object_id = UINT64_C(0x100000001),
                       .data = (const uint8_t *)payload,
                       .size = strlen(payload),
                       .is_keyframe = true};
@@ -292,6 +324,13 @@ int main(void) {
   /* verify packet payloads */
   if (strcmp((char *)client_state.received_data, payload) != 0) {
     fprintf(stderr, "payload verification failed\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+  if (client_state.video_group_id != UINT64_C(0x10000002a) ||
+      client_state.video_object_id != UINT64_C(0x100000001)) {
+    fprintf(stderr, "datagram object IDs were truncated\n");
     transport_destroy(client);
     transport_destroy(server);
     return 1;

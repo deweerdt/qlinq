@@ -70,3 +70,22 @@ bool transport_stream_write_track_frame(quicly_stream_t *stream, uint8_t type,
     return false;
   return transport_stream_write_frame(stream, type, payload, encoded_len);
 }
+
+bool transport_stream_write_object_frame(quicly_stream_t *stream, uint8_t alias,
+                                         const moq_object_t *object) {
+  if (!stream || !object || (object->size > 0 && !object->data) ||
+      object->size > TRANSPORT_MAX_RELIABLE_OBJECT_SIZE)
+    return false;
+  uint8_t header[QLINQ_WIRE_TRACK_OBJECT_HEADER_SIZE];
+  qlinq_wire_track_object_t wire_object = {.alias = alias,
+                                           .is_keyframe = object->is_keyframe,
+                                           .priority = object->priority,
+                                           .group_id = object->group_id,
+                                           .object_id = object->object_id};
+  if (qlinq_wire_encode_track_object(header, sizeof(header), &wire_object) !=
+      QLINQ_WIRE_OK)
+    return false;
+  return transport_stream_write_parts(stream, QLINQ_WIRE_TRACK_OBJECT, header,
+                                      sizeof(header), object->data,
+                                      object->size);
+}

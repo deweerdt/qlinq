@@ -17,88 +17,6 @@
 #include <sys/un.h>
 #include <unistd.h>
 
-#define TEST_MAX_PATHS 4
-#define TEST_MAX_CONNECTIONS 32
-#define TEST_SENT_CACHE_SIZE 32
-#define TEST_ARENA_MAX_FALLBACKS 1024
-
-typedef struct {
-  uint8_t *buffer;
-  size_t capacity;
-  size_t offset;
-  void *fallbacks[TEST_ARENA_MAX_FALLBACKS];
-  size_t fallback_count;
-} arena_t;
-
-typedef struct {
-  moq_track_id_t track_id;
-  uint64_t group_id;
-  uint64_t object_id;
-  uint8_t *data;
-  size_t size;
-  uint8_t priority;
-  bool is_keyframe;
-  uint16_t total_symbols;
-  uint16_t data_symbols;
-  uint16_t symbol_size;
-} sent_object_cache_t;
-
-typedef struct transport_conn_t transport_conn_t;
-
-struct transport_t_internal {
-  transport_callback_t callback;
-  void *user_data;
-  bool is_server;
-  int fds[TEST_MAX_PATHS];
-  size_t num_fds;
-  struct sockaddr_storage local_addrs[TEST_MAX_PATHS];
-  socklen_t local_addrs_len[TEST_MAX_PATHS];
-  uint32_t local_ifindices[TEST_MAX_PATHS];
-
-  /* client connection */
-  struct sockaddr_storage remote_addrs[TEST_MAX_PATHS];
-  socklen_t remote_addrs_len[TEST_MAX_PATHS];
-  size_t num_remote_addrs;
-  quicly_context_t quic_ctx;
-  ptls_context_t tls_ctx;
-  ptls_openssl_sign_certificate_t sign_cert;
-  quicly_cid_plaintext_t next_cid;
-
-  path_state_t path_states[TEST_MAX_PATHS];
-  uint64_t last_pathflow_update;
-
-  int64_t min_owd_ns[TEST_MAX_PATHS];
-  fp_t latest_owd_fp[TEST_MAX_PATHS];
-  uint64_t last_telemetry_s_ns[TEST_MAX_PATHS];
-  uint64_t last_telemetry_r_ns[TEST_MAX_PATHS];
-
-  /* server connections list */
-  transport_conn_t *conns[TEST_MAX_CONNECTIONS];
-  size_t conn_count;
-
-  /* client connection */
-  transport_conn_t *client_conn;
-
-  /* stream open callback payload */
-  quicly_stream_open_t stream_open;
-  ptls_verify_certificate_t verifier;
-  quicly_receive_datagram_frame_t receive_datagram;
-
-  /* sent object history cache for NACK retransmissions */
-  sent_object_cache_t sent_cache[TEST_SENT_CACHE_SIZE];
-  size_t sent_cache_index;
-
-  /* simulated packet loss */
-  uint8_t simulated_loss_rate;
-
-  /* pre-allocated transport memory arena */
-  arena_t arena;
-
-  /* ifmon integration */
-  ifmon_watcher_t ifmon_w;
-  int ifmon_pipe[2];
-};
-
 typedef struct {
   bool connected;
   bool subscribed;
@@ -415,44 +333,17 @@ int main(void) {
 
   /* Test 60/5/10/25 split for 1000 packets */
   printf("testing 60/5/10/25 split for 1000 packets...\n");
-  struct transport_t_internal *s_t = (struct transport_t_internal *)server;
-  s_t->path_states[0].initialized = 1;
-  s_t->path_states[0].b_ewma = FP_FROM_INT(60);
-  s_t->path_states[0].l_ewma = FP_FROM_FLOAT(0.010f);
-  s_t->path_states[0].p_ewma = 0;
-  s_t->path_states[0].q_ewma = 0;
-
-  s_t->path_states[1].initialized = 1;
-  s_t->path_states[1].b_ewma = FP_FROM_INT(5);
-  s_t->path_states[1].l_ewma = FP_FROM_FLOAT(0.010f);
-  s_t->path_states[1].p_ewma = 0;
-  s_t->path_states[1].q_ewma = 0;
-
-  s_t->path_states[2].initialized = 1;
-  s_t->path_states[2].b_ewma = FP_FROM_INT(10);
-  s_t->path_states[2].l_ewma = FP_FROM_FLOAT(0.010f);
-  s_t->path_states[2].p_ewma = 0;
-  s_t->path_states[2].q_ewma = 0;
-
-  s_t->path_states[3].initialized = 1;
-  s_t->path_states[3].b_ewma = FP_FROM_INT(25);
-  s_t->path_states[3].l_ewma = FP_FROM_FLOAT(0.010f);
-  s_t->path_states[3].p_ewma = 0;
-  s_t->path_states[3].q_ewma = 0;
-
-  /* Prevent transport_tick from overwriting our mock state */
-  s_t->last_pathflow_update = UINT64_MAX / 2;
-
-  /* Increase socket buffer sizes to avoid packet drops under 1MB payload */
-  int buf_size = 4 * 1024 * 1024;
-  for (size_t i = 0; i < s_t->num_fds; i++) {
-    setsockopt(s_t->fds[i], SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
-    setsockopt(s_t->fds[i], SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
-  }
-  struct transport_t_internal *c_t = (struct transport_t_internal *)client;
-  for (size_t i = 0; i < c_t->num_fds; i++) {
-    setsockopt(c_t->fds[i], SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size));
-    setsockopt(c_t->fds[i], SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size));
+  if (!transport_mock_path_state(server, 0, 60, 10.0, 0.0) ||
+      !transport_mock_path_state(server, 1, 5, 10.0, 0.0) ||
+      !transport_mock_path_state(server, 2, 10, 10.0, 0.0) ||
+      !transport_mock_path_state(server, 3, 25, 10.0, 0.0)) {
+    fprintf(stderr, "failed to install deterministic path state\n");
+    close(log_fd);
+    transport_destroy(client);
+    transport_destroy(server);
+    close(listener_fd);
+    unlink(qlog_path);
+    return 1;
   }
 
   /* Fetch baseline stats from server connection paths */
@@ -470,12 +361,7 @@ int main(void) {
   }
 
   /* Determine exact symbol size to build exact symbol counts */
-  size_t symbol_size = 1100;
-  if (s_t->quic_ctx.initial_egress_max_udp_payload_size > 80) {
-    symbol_size = s_t->quic_ctx.initial_egress_max_udp_payload_size - 80;
-  }
-  if (symbol_size < 1000)
-    symbol_size = 1000;
+  size_t symbol_size = transport_get_datagram_symbol_size(server);
 
   /* Publish 20 objects of 50 symbols each to make 1000 packets total */
   printf("publishing 1000 packets in 20 chunks of 50 packets to prevent socket "
@@ -510,7 +396,6 @@ int main(void) {
     /* Tick client and server in a loop to transfer this chunk */
     retries = 2000;
     while (retries-- > 0 && !client_state.object_received) {
-      s_t->last_pathflow_update = ptls_get_time.cb(&ptls_get_time);
       transport_tick(server);
       transport_tick(client);
       drain_qlog(log_fd);
