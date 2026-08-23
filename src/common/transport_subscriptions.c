@@ -2,7 +2,44 @@
 
 #include "quicly/streambuf.h"
 
+#include <stdlib.h>
 #include <string.h>
+
+bool transport_subscriptions_init(transport_subscription_table_t *table,
+                                  size_t capacity) {
+  if (!table || capacity == 0 || capacity > TRANSPORT_HARD_MAX_SUBSCRIPTIONS)
+    return false;
+  track_subscription_t *entries = calloc(capacity, sizeof(*entries));
+  if (!entries)
+    return false;
+  free(table->entries);
+  table->entries = entries;
+  table->capacity = capacity;
+  return true;
+}
+
+void transport_subscriptions_destroy(transport_subscription_table_t *table) {
+  if (!table)
+    return;
+  free(table->entries);
+  memset(table, 0, sizeof(*table));
+}
+
+size_t
+transport_subscriptions_count(const transport_subscription_table_t *table) {
+  if (!table)
+    return 0;
+  size_t count = 0;
+  for (size_t i = 0; i < table->capacity; i++)
+    count += table->entries[i].active ? 1U : 0U;
+  return count;
+}
+
+static bool ensure_initialized(transport_subscription_table_t *table) {
+  return table &&
+         (table->entries || transport_subscriptions_init(
+                                table, TRANSPORT_DEFAULT_MAX_SUBSCRIPTIONS));
+}
 
 static bool track_matches(const moq_track_id_t *track, moq_track_type_t type,
                           const char *name) {
@@ -15,7 +52,7 @@ int transport_subscriptions_find_by_alias(
   if (!table || !out_track)
     return -1;
   memset(out_track, 0, sizeof(*out_track));
-  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+  for (size_t i = 0; i < table->capacity; i++) {
     const track_subscription_t *entry = &table->entries[i];
     if (entry->active && entry->alias == alias) {
       *out_track = entry->track_id;
@@ -30,7 +67,7 @@ int transport_subscriptions_find_alias(
     uint8_t *out_alias) {
   if (!table || !track || !out_alias)
     return -1;
-  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+  for (size_t i = 0; i < table->capacity; i++) {
     const track_subscription_t *entry = &table->entries[i];
     if (entry->active &&
         track_matches(&entry->track_id, track->type, track->name)) {
@@ -46,7 +83,7 @@ transport_subscriptions_find(transport_subscription_table_t *table,
                              const moq_track_id_t *track) {
   if (!table || !track)
     return NULL;
-  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+  for (size_t i = 0; i < table->capacity; i++) {
     track_subscription_t *entry = &table->entries[i];
     if (entry->active &&
         track_matches(&entry->track_id, track->type, track->name))
@@ -60,7 +97,7 @@ transport_subscriptions_find_const(const transport_subscription_table_t *table,
                                    const moq_track_id_t *track) {
   if (!table || !track)
     return NULL;
-  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+  for (size_t i = 0; i < table->capacity; i++) {
     const track_subscription_t *entry = &table->entries[i];
     if (entry->active &&
         track_matches(&entry->track_id, track->type, track->name))
@@ -77,9 +114,15 @@ bool transport_subscriptions_contains(
 bool transport_subscriptions_add(transport_subscription_table_t *table,
                                  moq_track_type_t type, uint8_t flags,
                                  const char *name, uint8_t alias) {
-  if (!table || !name)
+  if (!ensure_initialized(table) || !name)
     return false;
-  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+  for (size_t i = 0; i < table->capacity; i++) {
+    const track_subscription_t *entry = &table->entries[i];
+    if (entry->active && entry->alias == alias &&
+        !track_matches(&entry->track_id, type, name))
+      return false;
+  }
+  for (size_t i = 0; i < table->capacity; i++) {
     track_subscription_t *entry = &table->entries[i];
     if (entry->active && track_matches(&entry->track_id, type, name)) {
       entry->alias = alias;
@@ -87,7 +130,7 @@ bool transport_subscriptions_add(transport_subscription_table_t *table,
       return true;
     }
   }
-  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+  for (size_t i = 0; i < table->capacity; i++) {
     track_subscription_t *entry = &table->entries[i];
     if (!entry->active) {
       memset(entry, 0, sizeof(*entry));
@@ -109,7 +152,7 @@ void transport_subscriptions_remove(transport_subscription_table_t *table,
                                     moq_track_type_t type, const char *name) {
   if (!table || !name)
     return;
-  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+  for (size_t i = 0; i < table->capacity; i++) {
     track_subscription_t *entry = &table->entries[i];
     if (entry->active && track_matches(&entry->track_id, type, name)) {
       entry->active = false;
@@ -125,7 +168,7 @@ void transport_subscriptions_clear_stream(transport_subscription_table_t *table,
                                           quicly_stream_t *stream) {
   if (!table || !stream)
     return;
-  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+  for (size_t i = 0; i < table->capacity; i++) {
     track_subscription_t *entry = &table->entries[i];
     if (entry->active && entry->stream == stream) {
       entry->stream = NULL;
@@ -139,7 +182,7 @@ bool transport_subscriptions_bind_stream(transport_subscription_table_t *table,
                                          quicly_stream_t *stream) {
   if (!table || !stream)
     return false;
-  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+  for (size_t i = 0; i < table->capacity; i++) {
     track_subscription_t *entry = &table->entries[i];
     if (entry->active && entry->alias == alias) {
       entry->stream = stream;
@@ -154,7 +197,7 @@ int transport_subscriptions_next_alias(
   if (!table || first_dynamic_alias < 0 || first_dynamic_alias > UINT8_MAX)
     return -1;
   int next = first_dynamic_alias;
-  for (size_t i = 0; i < TRANSPORT_MAX_SUBSCRIPTIONS; i++) {
+  for (size_t i = 0; i < table->capacity; i++) {
     const track_subscription_t *entry = &table->entries[i];
     if (entry->active && entry->alias >= next) {
       if (entry->alias == UINT8_MAX)

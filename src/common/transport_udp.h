@@ -5,10 +5,11 @@
 #include <sys/socket.h>
 #include <sys/uio.h>
 
-/* Returns 0 when every datagram was sent, 1 for a non-fatal would-block or
- * partial send, and -1 for a hard socket error. */
-int transport_udp_send_batch(int fd, const struct sockaddr *destination,
-                             socklen_t destination_len,
-                             const struct iovec *datagrams, size_t count);
+/* Returns the number of complete datagrams sent. A short result means the
+ * socket would block. Returns -1 only when no datagram was sent and a hard
+ * socket error occurred. */
+ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
+                                 socklen_t destination_len,
+                                 const struct iovec *datagrams, size_t count);
 
 #endif

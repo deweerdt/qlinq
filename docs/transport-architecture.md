@@ -6,7 +6,12 @@ types and the wire codec.
 
 | Module | Responsibility |
 | --- | --- |
-| `transport_quicly.c` | Connection lifecycle, event loop, protocol dispatch, publishing orchestration |
+| `transport_quicly.c` | Connection lifecycle, socket event loop, and public control/query API |
+| `transport_internal.h` | Private shared transport and connection state |
+| `transport_config.c` | Default resolution and validation of resource limits |
+| `transport_protocol.c` | HELLO negotiation, stream dispatch, datagram receive, and FEC assembly |
+| `transport_publish.c` | Reliable/datagram publication, FEC generation, and grouped data flushes |
+| `transport_tracks.c` | Small delivery-class validation and profile derivation |
 | `transport_wire.c` | Versioned, bounded byte-level encoding and decoding |
 | `transport_stream.c` | Atomic stream-frame construction and emission |
 | `transport_subscriptions.c` | Track/alias lookup, allocation, and stream binding |
@@ -16,12 +21,13 @@ types and the wire codec.
 | `transport_repair.c` | Bounded NACK symbol reconstruction |
 | `transport_scheduler.c` | Per-connection path and redundancy planning |
 | `transport_tls.c` | Certificate loading and verifier initialization |
-| `transport_udp.c` | Portable UDP batch emission and Linux GSO acceleration |
+| `transport_egress.c` | Owned, bounded queues for packets awaiting socket writability |
+| `transport_udp.c` | Portable UDP batch system calls and Linux GSO acceleration |
 
-The extracted modules do not call the public transport API and do not own the
-event loop. `transport_quicly.c` coordinates them, while each module owns the
-allocation and invariants of its state. This keeps QUIC callbacks centralized
-without exposing private transport structures in the public header.
+The protocol and publication engines operate on private state but do not own the
+socket event loop. `transport_quicly.c` coordinates lifecycle and polling while
+each module owns its invariants. The public header continues to expose opaque
+handles.
 
 ## Ownership rules
 
@@ -30,6 +36,9 @@ without exposing private transport structures in the public header.
   subscription entries.
 - `transport_fec_state` owns cached FEC instances and copies of sent objects.
 - `transport_stream` emits complete frames in one Quicly egress operation.
+- `transport_egress` copies any QUIC packets not accepted immediately by the
+  kernel. Quicly is not asked for another batch unless every possible output
+  socket has room for one complete batch.
 - `transport_wire` is the only code that reads or writes multibyte wire fields.
 - Path measurements and scheduler state belong to a connection; one client's
   RTT, loss, or telemetry must never determine another client's schedule.
@@ -38,10 +47,20 @@ without exposing private transport structures in the public header.
 - NACK handling sends at most 64 requested symbols per repair and accepts at
   most 16 repair requests per connection per second.
 - Event payload pointers are borrowed and valid only during the callback.
+- The creating thread owns a transport. Callbacks run synchronously on that
+  thread and may call non-driving APIs; recursive ticks, callback destruction,
+  and cross-thread operations are rejected.
+- HELLO negotiation completes before `TRANSPORT_EVENT_CONNECTED`, so capability
+  and effective-limit snapshots are valid inside the connected callback.
 
 `transport_publish_ex` distinguishes delivery, buffering, no recipients,
 partial delivery, backpressure, invalid input, and internal failure. The legacy
 boolean wrapper returns false for partial delivery and all failures.
+
+`transport_get_stats` reports protocol errors, handshake counts, FEC outcomes,
+thread-contract violations, UDP would-block/errors, and current/peak egress
+occupancy. `transport_get_conn_stats` adds stable connection IDs, negotiated
+limits, authentication state, subscriptions, and receive counters.
 
 Component-level tests cover these ownership and lookup boundaries. End-to-end
 tests cover connection establishment, authentication, reliable streams,

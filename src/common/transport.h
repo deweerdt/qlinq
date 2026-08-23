@@ -75,7 +75,18 @@ typedef struct {
 } transport_event_t;
 
 /* Pointers inside an event, including object.data and auth.token, are borrowed
- * and remain valid only for the duration of the callback. */
+ * and remain valid only for the duration of the callback.
+ *
+ * Threading contract:
+ * - A transport is bound to the thread that calls transport_create(). Every
+ *   public operation on that transport must be called by that owner thread.
+ * - Callbacks execute synchronously on the owner thread from transport_tick().
+ * - A callback may publish, subscribe, authenticate, close a connection, and
+ *   call query functions. It must not call transport_tick() recursively or
+ *   destroy the transport. Rejected contract violations are counted in
+ *   transport_stats_t.
+ * - qlinq performs no application callbacks from its interface-monitor thread.
+ */
 
 /* callback for receiving transport events */
 typedef void (*transport_callback_t)(void *user_data,
@@ -83,8 +94,39 @@ typedef void (*transport_callback_t)(void *user_data,
 
 #define TRANSPORT_MAX_PATHS 4
 
+/* Zero-valued limit fields select these defaults. Limits are deliberately
+ * transport-level bounds, not application schemas or track hierarchies. */
+#define TRANSPORT_DEFAULT_MAX_CONNECTIONS 32U
+#define TRANSPORT_DEFAULT_MAX_SUBSCRIPTIONS 32U
+#define TRANSPORT_DEFAULT_MAX_ASSEMBLERS 8U
+#define TRANSPORT_DEFAULT_MAX_REPAIR_REQUESTS_PER_SECOND 16U
+#define TRANSPORT_DEFAULT_MAX_EGRESS_PACKETS 1024U
+#define TRANSPORT_DEFAULT_MAX_EGRESS_BYTES (2U * 1024U * 1024U)
+#define TRANSPORT_DEFAULT_ASSEMBLER_MEMORY_BUDGET (64U * 1024U * 1024U)
+#define TRANSPORT_DEFAULT_MAX_PACKETS_PER_TICK 1024U
+
+#define TRANSPORT_HARD_MAX_CONNECTIONS 1024U
+#define TRANSPORT_HARD_MAX_SUBSCRIPTIONS 256U
+#define TRANSPORT_HARD_MAX_ASSEMBLERS 8U
+#define TRANSPORT_HARD_MAX_EGRESS_PACKETS 65536U
+
+typedef struct {
+  size_t max_connections;
+  size_t max_subscriptions_per_connection;
+  size_t max_assemblers_per_connection;
+  size_t max_repair_requests_per_second;
+  size_t max_egress_packets_per_socket;
+  size_t max_egress_bytes_per_socket;
+  size_t max_assembler_memory_bytes;
+  size_t max_reliable_object_size;
+  size_t max_fec_object_size;
+  size_t max_udp_payload_size;
+  size_t max_packets_per_tick;
+} transport_limits_t;
+
 /* Wire and flow-control limits enforced by the transport. */
 #define TRANSPORT_MAX_RELIABLE_OBJECT_SIZE ((1024U * 1024U) - 16U)
+#define TRANSPORT_MAX_FEC_OBJECT_SIZE (1024U * 1024U)
 #define TRANSPORT_MAX_FEC_RECORD_SIZE UINT16_MAX
 
 #define TRANSPORT_APP_ERROR_PROTOCOL 0x100U
@@ -107,6 +149,7 @@ typedef struct {
   void *user_data;
   uint8_t simulated_loss_rate; /* 0 to 100 representing percentage of packets to
                                   drop */
+  transport_limits_t limits;   /* zero fields select documented defaults */
 } transport_config_t;
 
 /* create and destroy transport instances */
@@ -169,6 +212,59 @@ typedef struct {
   double relative_owd;
   double ewma_latency;
 } transport_path_stats_t;
+
+typedef struct {
+  uint64_t connections_accepted;
+  uint64_t connections_rejected;
+  uint64_t connections_closed;
+  uint64_t protocol_handshakes_completed;
+  uint64_t protocol_errors;
+  uint64_t resource_limit_errors;
+  uint64_t stream_frames_received;
+  uint64_t datagrams_received;
+  uint64_t malformed_datagrams;
+  uint64_t fec_objects_recovered;
+  uint64_t fec_objects_lost;
+  uint64_t repair_requests_received;
+  uint64_t repair_requests_throttled;
+  uint64_t events_emitted;
+  uint64_t api_thread_violations;
+  uint64_t recursive_tick_rejections;
+  uint64_t callback_destroy_rejections;
+  uint64_t udp_packets_sent;
+  uint64_t udp_bytes_sent;
+  uint64_t udp_would_block;
+  uint64_t udp_send_errors;
+  uint64_t egress_packets_queued;
+  uint64_t egress_bytes_queued;
+  uint64_t egress_packets_dropped;
+  size_t egress_current_packets;
+  size_t egress_current_bytes;
+  size_t egress_peak_packets;
+  size_t egress_peak_bytes;
+  size_t active_connections;
+  size_t assembler_memory_bytes;
+} transport_stats_t;
+
+typedef struct {
+  uint32_t id;
+  bool quic_ready;
+  bool protocol_ready;
+  bool authenticated;
+  size_t subscriptions;
+  uint32_t peer_capabilities;
+  transport_limits_t negotiated_limits;
+  uint64_t stream_frames_received;
+  uint64_t datagrams_received;
+  uint64_t malformed_datagrams;
+} transport_conn_stats_t;
+
+/* Snapshot aggregate or per-connection observability. These functions follow
+ * the same owner-thread rule as the rest of the API. */
+bool transport_get_stats(transport_t *t, transport_stats_t *stats);
+bool transport_get_conn_stats(transport_t *t, transport_conn_t *conn,
+                              transport_conn_stats_t *stats);
+uint32_t transport_get_conn_id(transport_t *t, transport_conn_t *conn);
 
 bool transport_get_path_stats(transport_t *t, size_t path_idx,
                               transport_path_stats_t *stats);

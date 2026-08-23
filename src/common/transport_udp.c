@@ -64,9 +64,9 @@ static bool try_gso(int fd, const struct sockaddr *destination,
 }
 #endif
 
-int transport_udp_send_batch(int fd, const struct sockaddr *destination,
-                             socklen_t destination_len,
-                             const struct iovec *datagrams, size_t count) {
+ssize_t transport_udp_send_batch(int fd, const struct sockaddr *destination,
+                                 socklen_t destination_len,
+                                 const struct iovec *datagrams, size_t count) {
   if (fd < 0 || !destination || (!datagrams && count > 0)) {
     errno = EINVAL;
     return -1;
@@ -80,7 +80,7 @@ int transport_udp_send_batch(int fd, const struct sockaddr *destination,
 
 #ifdef __linux__
   if (try_gso(fd, destination, destination_len, datagrams, count))
-    return 0;
+    return (ssize_t)count;
 
   struct mmsghdr messages[TRANSPORT_UDP_MAX_BATCH];
   struct iovec iovs[TRANSPORT_UDP_MAX_BATCH];
@@ -102,22 +102,30 @@ int transport_udp_send_batch(int fd, const struct sockaddr *destination,
     }
     if (sent < 0 && errno == EINTR)
       continue;
-    int result = sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK) ? 1 : -1;
-    return result;
+    if (sent < 0 && (errno == EAGAIN || errno == EWOULDBLOCK))
+      return (ssize_t)sent_count;
+    return sent_count > 0 ? (ssize_t)sent_count : -1;
   }
-  return 0;
+  return (ssize_t)sent_count;
 #else
+  size_t sent_count = 0;
   for (size_t i = 0; i < count; i++) {
     ssize_t sent;
     do {
       sent = sendto(fd, datagrams[i].iov_base, datagrams[i].iov_len, 0,
                     destination, destination_len);
     } while (sent < 0 && errno == EINTR);
-    if (sent < 0)
-      return errno == EAGAIN || errno == EWOULDBLOCK ? 1 : -1;
-    if ((size_t)sent != datagrams[i].iov_len)
-      return 1;
+    if (sent < 0) {
+      if (errno == EAGAIN || errno == EWOULDBLOCK)
+        return (ssize_t)sent_count;
+      return sent_count > 0 ? (ssize_t)sent_count : -1;
+    }
+    if ((size_t)sent != datagrams[i].iov_len) {
+      errno = EIO;
+      return sent_count > 0 ? (ssize_t)sent_count : -1;
+    }
+    sent_count++;
   }
-  return 0;
+  return (ssize_t)sent_count;
 #endif
 }

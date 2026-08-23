@@ -5,8 +5,6 @@
 
 #include "quicly.h"
 
-#define TRANSPORT_MAX_SUBSCRIPTIONS 32U
-
 typedef struct {
   moq_track_id_t track_id;
   uint8_t alias;
@@ -15,8 +13,15 @@ typedef struct {
 } track_subscription_t;
 
 typedef struct {
-  track_subscription_t entries[TRANSPORT_MAX_SUBSCRIPTIONS];
+  track_subscription_t *entries;
+  size_t capacity;
 } transport_subscription_table_t;
+
+bool transport_subscriptions_init(transport_subscription_table_t *table,
+                                  size_t capacity);
+void transport_subscriptions_destroy(transport_subscription_table_t *table);
+size_t
+transport_subscriptions_count(const transport_subscription_table_t *table);
 
 int transport_subscriptions_find_by_alias(
     const transport_subscription_table_t *table, uint8_t alias,

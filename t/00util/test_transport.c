@@ -1,6 +1,7 @@
 /* test_transport.c */
 
 #include "transport.h"
+#include <inttypes.h>
 #include <stdbool.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -22,13 +23,24 @@ typedef struct {
   uint8_t catalog_priority;
   uint64_t video_group_id;
   uint64_t video_object_id;
+  bool protocol_ready_observed;
+  uint32_t connection_id;
 } test_state_t;
+
+static void record_connection(test_state_t *state, transport_conn_t *conn) {
+  transport_conn_stats_t stats;
+  if (transport_get_conn_stats(state->transport, conn, &stats)) {
+    state->protocol_ready_observed = stats.protocol_ready;
+    state->connection_id = transport_get_conn_id(state->transport, conn);
+  }
+}
 
 static void on_server_event(void *user_data, const transport_event_t *event) {
   test_state_t *state = user_data;
   switch (event->type) {
   case TRANSPORT_EVENT_CONNECTED:
     state->connected = true;
+    record_connection(state, event->conn);
     break;
   case TRANSPORT_EVENT_SUBSCRIBE:
     if (event->track_id.type == MOQ_TRACK_TEXT &&
@@ -66,6 +78,7 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
   test_state_t *state = user_data;
   switch (event->type) {
   case TRANSPORT_EVENT_CONNECTED:
+    record_connection(state, event->conn);
     transport_send_auth(state->transport, event->conn,
                         (const uint8_t *)"secret_token_123",
                         strlen("secret_token_123"));
@@ -249,6 +262,14 @@ int main(void) {
     transport_destroy(server);
     return 1;
   }
+  if (!client_state.protocol_ready_observed ||
+      !server_state.protocol_ready_observed ||
+      client_state.connection_id == 0 || server_state.connection_id == 0) {
+    fprintf(stderr, "protocol handshake was not observable at connect time\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
 
   /* client subscribes to the catalog track */
   printf("subscribing to catalog track...\n");
@@ -314,8 +335,20 @@ int main(void) {
   }
 
   if (!client_state.object_received) {
+    transport_stats_t client_diagnostic = {0};
+    transport_stats_t server_diagnostic = {0};
+    (void)transport_get_stats(client, &client_diagnostic);
+    (void)transport_get_stats(server, &server_diagnostic);
     fprintf(stderr,
-            "client did not receive published object on dynamic track\n");
+            "client did not receive published object on dynamic track "
+            "(rx=%" PRIu64 ", malformed=%" PRIu64 ", sent=%" PRIu64
+            ", queued=%zu, dropped=%" PRIu64 ", errors=%" PRIu64 ")\n",
+            client_diagnostic.datagrams_received,
+            client_diagnostic.malformed_datagrams,
+            server_diagnostic.udp_packets_sent,
+            server_diagnostic.egress_current_packets,
+            server_diagnostic.egress_packets_dropped,
+            server_diagnostic.udp_send_errors);
     transport_destroy(client);
     transport_destroy(server);
     return 1;
@@ -418,6 +451,22 @@ int main(void) {
     return 1;
   }
   free(queue_payload);
+
+  transport_stats_t client_stats;
+  transport_stats_t server_stats;
+  if (!transport_get_stats(client, &client_stats) ||
+      !transport_get_stats(server, &server_stats) ||
+      client_stats.protocol_handshakes_completed != 1 ||
+      server_stats.protocol_handshakes_completed != 1 ||
+      client_stats.stream_frames_received == 0 ||
+      server_stats.stream_frames_received == 0 ||
+      client_stats.active_connections != 1 ||
+      server_stats.active_connections != 1) {
+    fprintf(stderr, "transport observability snapshot was incomplete\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
 
   printf("===TRANSPORT OK===\n");
 
