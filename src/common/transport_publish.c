@@ -155,29 +155,278 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
   return TRANSPORT_PUBLISH_DELIVERED;
 }
 
-bool transport_publish_flush_grouped(transport_t *t) {
-  if (t->fec_buf_len == 0)
-    return true;
+static transport_fec_track_state_t *
+find_fec_track_state(transport_t *t, const moq_track_id_t *track_id,
+                     bool create) {
+  transport_fec_track_state_t *available = NULL;
+  for (size_t i = 0; i < TRANSPORT_HARD_MAX_SUBSCRIPTIONS; i++) {
+    transport_fec_track_state_t *state = &t->fec_tracks[i];
+    if (state->active && transport_track_id_equal(&state->track_id, track_id))
+      return state;
+    if (!state->active && !available)
+      available = state;
+  }
+  if (!create || !available)
+    return NULL;
+  available->track_id = *track_id;
+  available->active = true;
+  return available;
+}
 
+static bool checkpoint_ack_pending(
+    const transport_checkpoint_ack_state_t *state) {
+  return state && state->sent_initialized &&
+         (!state->acked_initialized ||
+          state->acked_group_id != state->sent_group_id ||
+          state->acked_object_id < state->sent_object_id);
+}
+
+static void checkpoint_mark_sent(transport_checkpoint_ack_state_t *state,
+                                 uint64_t group_id, uint64_t object_id) {
+  bool already_pending = checkpoint_ack_pending(state);
+  state->sent_initialized = true;
+  state->sent_group_id = group_id;
+  state->sent_object_id = object_id;
+  if (!already_pending || state->oldest_unacked_sent_at_ms <= 0)
+    state->oldest_unacked_sent_at_ms = transport_get_time_ms();
+}
+
+static void release_acked_checkpoints(transport_t *t,
+                                      const moq_track_id_t *track_id) {
+  bool found_capable_member = false;
+  bool found_legacy_member = false;
+  bool minimum_initialized = false;
+  uint64_t minimum_group_id = 0;
+  uint64_t minimum_object_id = 0;
+  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  for (size_t i = 0; i < active_count; i++) {
+    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    uint8_t alias = 0;
+    if (!conn || transport_subscriptions_find_alias(&conn->subscriptions,
+                                                    track_id, &alias) != 0)
+      continue;
+    if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0) {
+      found_legacy_member = true;
+      continue;
+    }
+    transport_checkpoint_ack_state_t *state = &conn->checkpoint_acks[alias];
+    if (!state->participating)
+      continue;
+    found_capable_member = true;
+    if (!state->acked_initialized)
+      return;
+    if (!minimum_initialized || state->acked_object_id < minimum_object_id) {
+      minimum_initialized = true;
+      minimum_group_id = state->acked_group_id;
+      minimum_object_id = state->acked_object_id;
+    } else if (state->acked_group_id != minimum_group_id) {
+      return;
+    }
+  }
+  if (found_legacy_member)
+    return;
+  size_t released = 0;
+  if (found_capable_member && minimum_initialized)
+    released = transport_sent_cache_release_through(
+        &t->sent_cache, track_id, minimum_group_id, minimum_object_id);
+  else if (!found_capable_member)
+    released = transport_sent_cache_release_track(&t->sent_cache, track_id);
+  t->stats.recovery_cache_releases += released;
+}
+
+void transport_publish_checkpoint_member_added(transport_t *t,
+                                               transport_conn_t *conn,
+                                               const moq_track_id_t *track_id,
+                                               uint8_t alias) {
+  if (!t || !conn || !track_id ||
+      (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0 ||
+      track_id->type != MOQ_TRACK_DATA ||
+      (track_id->flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0)
+    return;
+  transport_checkpoint_ack_state_t *ack = &conn->checkpoint_acks[alias];
+  memset(ack, 0, sizeof(*ack));
+  ack->participating = true;
+
+  transport_fec_track_state_t *track = find_fec_track_state(t, track_id, false);
+  if (track && track->checkpoint_initialized && conn->stream &&
+      quicly_sendstate_is_open(&conn->stream->sendstate) &&
+      transport_stream_write_track_checkpoint_frame(
+          conn->stream, alias, track->checkpoint_group_id,
+          track->last_checkpoint_object_id, track->last_checkpoint_object_id,
+          true)) {
+    ack->sent_initialized = true;
+    ack->sent_group_id = track->checkpoint_group_id;
+    ack->sent_object_id = track->last_checkpoint_object_id;
+    ack->acked_initialized = true;
+    ack->acked_group_id = track->checkpoint_group_id;
+    ack->acked_object_id = track->last_checkpoint_object_id;
+    t->stats.recovery_checkpoints_sent++;
+  }
+}
+
+void transport_publish_checkpoint_member_removed(transport_t *t,
+                                                 transport_conn_t *conn,
+                                                 const moq_track_id_t *track_id,
+                                                 uint8_t alias) {
+  if (!t || !conn || !track_id)
+    return;
+  memset(&conn->checkpoint_acks[alias], 0,
+         sizeof(conn->checkpoint_acks[alias]));
+  release_acked_checkpoints(t, track_id);
+}
+
+void transport_publish_checkpoint_connection_removed(transport_t *t,
+                                                     transport_conn_t *conn) {
+  if (!t || !conn)
+    return;
+  for (size_t i = 0; i < conn->subscriptions.capacity; i++) {
+    track_subscription_t *subscription = &conn->subscriptions.entries[i];
+    if (!subscription->active)
+      continue;
+    uint8_t alias = subscription->alias;
+    if (!conn->checkpoint_acks[alias].participating)
+      continue;
+    moq_track_id_t track_id = subscription->track_id;
+    memset(&conn->checkpoint_acks[alias], 0,
+           sizeof(conn->checkpoint_acks[alias]));
+    release_acked_checkpoints(t, &track_id);
+  }
+}
+
+bool transport_publish_checkpoint_acked(
+    transport_t *t, transport_conn_t *conn,
+    const qlinq_wire_track_checkpoint_ack_t *ack,
+    const moq_track_id_t *track_id) {
+  if (!t || !conn || !ack || !track_id ||
+      (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0)
+    return false;
+  transport_checkpoint_ack_state_t *state = &conn->checkpoint_acks[ack->alias];
+  if (!state->participating || !state->sent_initialized ||
+      ack->group_id != state->sent_group_id ||
+      ack->final_object_id > state->sent_object_id)
+    return false;
+  bool advanced = !state->acked_initialized ||
+                  ack->final_object_id > state->acked_object_id;
+  if (advanced) {
+    state->acked_initialized = true;
+    state->acked_group_id = ack->group_id;
+    state->acked_object_id = ack->final_object_id;
+  }
+  if (!checkpoint_ack_pending(state))
+    state->oldest_unacked_sent_at_ms = 0;
+  else if (advanced)
+    state->oldest_unacked_sent_at_ms = transport_get_time_ms();
+  release_acked_checkpoints(t, track_id);
+  return true;
+}
+
+static bool checkpoint_cache_is_protected(transport_t *t,
+                                          const moq_track_id_t *track_id) {
+  bool found = false;
+  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  for (size_t i = 0; i < active_count; i++) {
+    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    uint8_t alias = 0;
+    if (!conn || transport_subscriptions_find_alias(&conn->subscriptions,
+                                                    track_id, &alias) != 0)
+      continue;
+    if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0)
+      return false;
+    if (conn->checkpoint_acks[alias].participating)
+      found = true;
+  }
+  return found;
+}
+
+static bool emit_rolling_checkpoint(transport_t *t,
+                                    transport_fec_track_state_t *track,
+                                    uint64_t group_id, uint64_t first_object_id,
+                                    uint64_t final_object_id) {
+  bool succeeded = true;
+  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  for (size_t i = 0; i < active_count; i++) {
+    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    uint8_t alias = 0;
+    if (!conn || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
+        !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate) ||
+        quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING ||
+        (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0 ||
+        transport_subscriptions_find_alias(&conn->subscriptions,
+                                           &track->track_id, &alias) != 0)
+      continue;
+    if (!conn->checkpoint_acks[alias].participating)
+      transport_publish_checkpoint_member_added(t, conn, &track->track_id,
+                                                alias);
+    if (!transport_stream_write_track_checkpoint_frame(
+            conn->stream, alias, group_id, first_object_id, final_object_id,
+            false)) {
+      succeeded = false;
+      continue;
+    }
+    checkpoint_mark_sent(&conn->checkpoint_acks[alias], group_id,
+                         final_object_id);
+    t->stats.recovery_checkpoints_sent++;
+  }
+  track->checkpoint_initialized = true;
+  track->checkpoint_group_id = group_id;
+  track->last_checkpoint_object_id = final_object_id;
+  return succeeded;
+}
+
+static transport_publish_result_t
+transport_publish_flush_grouped_ex(transport_t *t) {
+  if (t->fec_buf_len == 0)
+    return TRANSPORT_PUBLISH_DELIVERED;
+  transport_fec_track_state_t *track_state =
+      find_fec_track_state(t, &t->fec_track_id, true);
+  if (!track_state)
+    return TRANSPORT_PUBLISH_ERROR;
   moq_object_t obj = {.track_id = t->fec_track_id,
                       .group_id = 0,
-                      .object_id = t->fec_object_id,
+                      .object_id = track_state->next_object_id,
                       .data = t->fec_buf,
                       .size = t->fec_buf_len,
                       .is_keyframe = false,
                       .priority = t->fec_priority};
-
   t->fec_in_flush = true;
-  bool published = transport_publish(t, &obj);
+  transport_publish_result_t result = transport_publish_ex(t, &obj);
   t->fec_in_flush = false;
-
-  if (!published)
-    return false;
-
-  t->fec_object_id++;
+  if (result != TRANSPORT_PUBLISH_DELIVERED &&
+      result != TRANSPORT_PUBLISH_NO_RECIPIENTS)
+    return result;
+  track_state->next_object_id++;
+  track_state->has_objects = true;
   t->fec_buf_len = 0;
   t->fec_first_pkt_time = 0;
   t->fec_pkt_count = 0;
+  if (track_state->next_object_id % QLINQ_RECOVERY_WINDOW_OBJECTS == 0) {
+    uint64_t first_object_id =
+        track_state->next_object_id - QLINQ_RECOVERY_WINDOW_OBJECTS;
+    (void)emit_rolling_checkpoint(t, track_state, 0, first_object_id,
+                                  track_state->next_object_id - 1U);
+  }
+  return TRANSPORT_PUBLISH_DELIVERED;
+}
+
+bool transport_publish_flush_grouped(transport_t *t) {
+  transport_publish_result_t result = transport_publish_flush_grouped_ex(t);
+  return result == TRANSPORT_PUBLISH_DELIVERED ||
+         result == TRANSPORT_PUBLISH_NO_RECIPIENTS;
+}
+
+bool transport_publish_finish_grouped(transport_t *t,
+                                      const moq_track_id_t *track_id,
+                                      uint64_t *final_object_id,
+                                      bool *has_objects) {
+  if (!t || !track_id || !final_object_id || !has_objects)
+    return false;
+  if (t->fec_buf_len > 0 &&
+      transport_track_id_equal(&t->fec_track_id, track_id) &&
+      !transport_publish_flush_grouped(t))
+    return false;
+  transport_fec_track_state_t *state = find_fec_track_state(t, track_id, false);
+  *has_objects = state && state->has_objects;
+  *final_object_id = *has_objects ? state->next_object_id - 1U : 0;
   return true;
 }
 
@@ -228,14 +477,22 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
       if (t->fec_buf_len > 0 &&
           (!transport_track_id_equal(&t->fec_track_id, &obj->track_id) ||
            t->fec_priority != obj->priority)) {
-        if (!transport_publish_flush_grouped(t))
+        transport_publish_result_t result =
+            transport_publish_flush_grouped_ex(t);
+        if (result == TRANSPORT_PUBLISH_BACKPRESSURE)
+          return result;
+        if (result != TRANSPORT_PUBLISH_DELIVERED)
           return TRANSPORT_PUBLISH_ERROR;
       }
 
       if (t->fec_buf_len > 0 &&
           (t->fec_pkt_count >= 4 || obj->size > 16384 - 2 ||
            t->fec_buf_len > 16384 - 2 - obj->size)) {
-        if (!transport_publish_flush_grouped(t))
+        transport_publish_result_t result =
+            transport_publish_flush_grouped_ex(t);
+        if (result == TRANSPORT_PUBLISH_BACKPRESSURE)
+          return result;
+        if (result != TRANSPORT_PUBLISH_DELIVERED)
           return TRANSPORT_PUBLISH_ERROR;
       }
 
@@ -272,9 +529,15 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
       t->fec_buf_len = needed;
       t->fec_pkt_count++;
 
-      if (t->fec_pkt_count >= 4 || t->fec_buf_len >= 16384)
-        return transport_publish_flush_grouped(t) ? TRANSPORT_PUBLISH_DELIVERED
-                                                  : TRANSPORT_PUBLISH_ERROR;
+      if (t->fec_pkt_count >= 4 || t->fec_buf_len >= 16384) {
+        transport_publish_result_t result =
+            transport_publish_flush_grouped_ex(t);
+        if (result == TRANSPORT_PUBLISH_BACKPRESSURE)
+          return TRANSPORT_PUBLISH_BUFFERED;
+        return result == TRANSPORT_PUBLISH_DELIVERED
+                   ? TRANSPORT_PUBLISH_DELIVERED
+                   : TRANSPORT_PUBLISH_ERROR;
+      }
       return TRANSPORT_PUBLISH_BUFFERED;
     }
   }
@@ -354,6 +617,14 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
   if (data_symbols == 0)
     data_symbols = 1;
 
+  bool protect_repair_cache = obj->track_id.type == MOQ_TRACK_DATA &&
+                              profile.fec_rateless &&
+                              checkpoint_cache_is_protected(t, &obj->track_id);
+  if (protect_repair_cache && !transport_sent_cache_has_space(&t->sent_cache)) {
+    t->stats.recovery_cache_backpressure++;
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
+  }
+
   size_t active_count =
       t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
   size_t eligible = 0;
@@ -395,7 +666,8 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
       obj->track_id.type == MOQ_TRACK_DATA &&
       !transport_sent_cache_store(&t->sent_cache, obj, maximum_sent_symbols,
                                   (uint16_t)data_symbols,
-                                  (uint16_t)symbol_size))
+                                  (uint16_t)symbol_size,
+                                  !protect_repair_cache))
     return delivered > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
 
   if (partially_queued || (delivered > 0 && delivered != eligible))
@@ -410,4 +682,55 @@ bool transport_publish(transport_t *t, const moq_object_t *obj) {
   return result == TRANSPORT_PUBLISH_DELIVERED ||
          result == TRANSPORT_PUBLISH_BUFFERED ||
          result == TRANSPORT_PUBLISH_NO_RECIPIENTS;
+}
+
+bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
+  if (!transport_owner_ok(t) || !transport_track_id_valid(&track_id) ||
+      track_id.type != MOQ_TRACK_DATA ||
+      (track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0)
+    return false;
+
+  uint64_t final_object_id = 0;
+  bool has_objects = false;
+  if (!transport_publish_finish_grouped(t, &track_id, &final_object_id,
+                                        &has_objects))
+    return false;
+  if (!has_objects)
+    return true;
+
+  size_t active_count = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
+  bool found = false;
+  bool succeeded = true;
+  for (size_t i = 0; i < active_count; i++) {
+    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    if (!conn || !conn->quic || !conn->protocol_ready || !conn->authenticated ||
+        !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate) ||
+        quicly_get_state(conn->quic) >= QUICLY_STATE_CLOSING)
+      continue;
+    uint8_t alias = 0;
+    if (transport_subscriptions_find_alias(&conn->subscriptions, &track_id,
+                                           &alias) != 0)
+      continue;
+    found = true;
+    if (transport_stream_write_track_end_frame(conn->stream, alias, 0,
+                                               final_object_id)) {
+      t->stats.track_ends_sent++;
+      if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) != 0) {
+        if (!conn->checkpoint_acks[alias].participating)
+          transport_publish_checkpoint_member_added(t, conn, &track_id, alias);
+        checkpoint_mark_sent(&conn->checkpoint_acks[alias], 0,
+                             final_object_id);
+      }
+    } else {
+      succeeded = false;
+    }
+  }
+  transport_fec_track_state_t *state =
+      find_fec_track_state(t, &track_id, false);
+  if (state) {
+    state->checkpoint_initialized = true;
+    state->checkpoint_group_id = 0;
+    state->last_checkpoint_object_id = final_object_id;
+  }
+  return !found || succeeded;
 }

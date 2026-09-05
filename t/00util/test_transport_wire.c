@@ -63,6 +63,11 @@ int main(void) {
                                 &frame) == QLINQ_WIRE_INVALID,
         "magic rejection");
   memcpy(corrupted, frame_buf, frame_len);
+  corrupted[3] = 10;
+  CHECK(qlinq_wire_decode_frame(corrupted, frame_len, sizeof(payload),
+                                &frame) == QLINQ_WIRE_INVALID,
+        "reserved Flexicast type rejection");
+  memcpy(corrupted, frame_buf, frame_len);
   corrupted[3] = 0xff;
   CHECK(qlinq_wire_decode_frame(corrupted, frame_len, sizeof(payload),
                                 &frame) == QLINQ_WIRE_INVALID,
@@ -294,6 +299,70 @@ int main(void) {
   CHECK(qlinq_wire_decode_hello(payload, QLINQ_WIRE_HELLO_SIZE,
                                 &decoded_hello) == QLINQ_WIRE_INVALID,
         "hello role validation");
+
+  qlinq_wire_track_end_t track_end = {
+      .alias = 22,
+      .group_id = large_group_id,
+      .final_object_id = large_object_id,
+  };
+  CHECK(qlinq_wire_encode_track_end(payload, sizeof(payload), &track_end) ==
+            QLINQ_WIRE_OK,
+        "track completion encode");
+  qlinq_wire_track_end_t decoded_end;
+  CHECK(qlinq_wire_decode_track_end(payload, QLINQ_WIRE_TRACK_END_SIZE,
+                                    &decoded_end) == QLINQ_WIRE_OK &&
+            decoded_end.alias == track_end.alias &&
+            decoded_end.group_id == track_end.group_id &&
+            decoded_end.final_object_id == track_end.final_object_id,
+        "track completion roundtrip");
+
+  qlinq_wire_track_checkpoint_t checkpoint = {
+      .alias = 22,
+      .flags = 0,
+      .group_id = large_group_id,
+      .first_object_id = 64,
+      .final_object_id = 95,
+  };
+  CHECK(qlinq_wire_encode_track_checkpoint(payload, sizeof(payload),
+                                           &checkpoint) == QLINQ_WIRE_OK,
+        "recovery checkpoint encode");
+  qlinq_wire_track_checkpoint_t decoded_checkpoint;
+  CHECK(qlinq_wire_decode_track_checkpoint(
+            payload, QLINQ_WIRE_TRACK_CHECKPOINT_SIZE, &decoded_checkpoint) ==
+                QLINQ_WIRE_OK &&
+            decoded_checkpoint.alias == checkpoint.alias &&
+            decoded_checkpoint.flags == checkpoint.flags &&
+            decoded_checkpoint.group_id == checkpoint.group_id &&
+            decoded_checkpoint.first_object_id == checkpoint.first_object_id &&
+            decoded_checkpoint.final_object_id == checkpoint.final_object_id,
+        "recovery checkpoint roundtrip");
+  checkpoint.first_object_id = 96;
+  CHECK(qlinq_wire_encode_track_checkpoint(payload, sizeof(payload),
+                                           &checkpoint) == QLINQ_WIRE_INVALID,
+        "recovery checkpoint range validation");
+  checkpoint.first_object_id = checkpoint.final_object_id;
+  checkpoint.flags = 0x80;
+  CHECK(qlinq_wire_encode_track_checkpoint(payload, sizeof(payload),
+                                           &checkpoint) == QLINQ_WIRE_INVALID,
+        "recovery checkpoint flag validation");
+
+  qlinq_wire_track_checkpoint_ack_t checkpoint_ack = {
+      .alias = 22,
+      .group_id = large_group_id,
+      .final_object_id = 95,
+  };
+  CHECK(qlinq_wire_encode_track_checkpoint_ack(
+            payload, sizeof(payload), &checkpoint_ack) == QLINQ_WIRE_OK,
+        "recovery checkpoint ACK encode");
+  qlinq_wire_track_checkpoint_ack_t decoded_checkpoint_ack;
+  CHECK(qlinq_wire_decode_track_checkpoint_ack(
+            payload, QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE,
+            &decoded_checkpoint_ack) == QLINQ_WIRE_OK &&
+            decoded_checkpoint_ack.alias == checkpoint_ack.alias &&
+            decoded_checkpoint_ack.group_id == checkpoint_ack.group_id &&
+            decoded_checkpoint_ack.final_object_id ==
+                checkpoint_ack.final_object_id,
+        "recovery checkpoint ACK roundtrip");
 
   printf("===TRANSPORT WIRE OK===\n");
   return 0;

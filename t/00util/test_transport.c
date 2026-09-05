@@ -18,6 +18,8 @@ typedef struct {
   int data_subscriptions;
   bool data_a_received;
   bool data_b_received;
+  bool checkpoint_subscribed;
+  size_t checkpoint_objects_received;
   uint64_t catalog_group_id;
   uint64_t catalog_object_id;
   uint8_t catalog_priority;
@@ -64,6 +66,9 @@ static void on_server_event(void *user_data, const transport_event_t *event) {
                (event->track_id.type == MOQ_TRACK_AUDIO &&
                 strcmp(event->track_id.name, "queue-limit") == 0)) {
       state->data_subscriptions++;
+    } else if (event->track_id.type == MOQ_TRACK_DATA &&
+               strcmp(event->track_id.name, "checkpoint-data") == 0) {
+      state->checkpoint_subscribed = true;
     }
     break;
   case TRANSPORT_EVENT_AUTH:
@@ -163,6 +168,9 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
     } else if (event->track_id.type == MOQ_TRACK_DATA &&
                strcmp(event->track_id.name, "data-b") == 0) {
       state->data_b_received = true;
+    } else if (event->track_id.type == MOQ_TRACK_DATA &&
+               strcmp(event->track_id.name, "checkpoint-data") == 0) {
+      state->checkpoint_objects_received++;
     }
     break;
   default:
@@ -418,6 +426,91 @@ int main(void) {
   }
   if (!client_state.data_a_received || !client_state.data_b_received) {
     fprintf(stderr, "mixed FEC tracks were not delivered independently\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
+  moq_track_id_t checkpoint_track = {.type = MOQ_TRACK_DATA,
+                                     .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                                     .name = "checkpoint-data"};
+  if (!transport_subscribe(client, checkpoint_track)) {
+    fprintf(stderr, "checkpoint subscription failed\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+  retries = 200;
+  while (retries-- > 0 && !server_state.checkpoint_subscribed) {
+    transport_tick(server);
+    transport_tick(client);
+    usleep(10 * 1000);
+  }
+  if (!server_state.checkpoint_subscribed) {
+    fprintf(stderr, "checkpoint subscription was not observed\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
+  const uint8_t checkpoint_record[] = "checkpoint-record";
+  for (uint64_t i = 0; i < 260; i++) {
+    moq_object_t record = {.track_id = checkpoint_track,
+                           .object_id = i,
+                           .data = checkpoint_record,
+                           .size = sizeof(checkpoint_record),
+                           .priority = 1};
+    if (!transport_publish(server, &record)) {
+      fprintf(stderr,
+              "rolling checkpoint publication failed at record %" PRIu64
+              "\n",
+              i);
+      transport_destroy(client);
+      transport_destroy(server);
+      return 1;
+    }
+  }
+  if (!transport_finish_track(server, checkpoint_track)) {
+    fprintf(stderr, "checkpoint track completion failed\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+  transport_stats_t checkpoint_source_stats = {0};
+  transport_stats_t checkpoint_receiver_stats = {0};
+  retries = 500;
+  while (retries-- > 0) {
+    transport_tick(server);
+    transport_tick(client);
+    (void)transport_get_stats(server, &checkpoint_source_stats);
+    (void)transport_get_stats(client, &checkpoint_receiver_stats);
+    if (client_state.checkpoint_objects_received == 65 &&
+        checkpoint_source_stats.recovery_checkpoint_acks_received >= 3 &&
+        checkpoint_source_stats.recovery_cache_releases >= 65)
+      break;
+    usleep(10 * 1000);
+  }
+  if (client_state.checkpoint_objects_received != 65 ||
+      checkpoint_source_stats.recovery_checkpoints_sent != 2 ||
+      checkpoint_receiver_stats.recovery_checkpoints_received != 2 ||
+      checkpoint_source_stats.recovery_checkpoint_acks_received < 3 ||
+      checkpoint_receiver_stats.recovery_checkpoint_acks_sent < 3 ||
+      checkpoint_source_stats.recovery_cache_releases < 65 ||
+      checkpoint_source_stats.track_ends_sent != 1 ||
+      checkpoint_receiver_stats.track_ends_received != 1) {
+    fprintf(stderr,
+            "rolling checkpoint lifecycle failed (objects=%zu, cp_tx=%" PRIu64
+            ", cp_rx=%" PRIu64 ", ack_tx=%" PRIu64 ", ack_rx=%" PRIu64
+            ", released=%" PRIu64 ", end_tx=%" PRIu64 ", end_rx=%" PRIu64
+            ")\n",
+            client_state.checkpoint_objects_received,
+            checkpoint_source_stats.recovery_checkpoints_sent,
+            checkpoint_receiver_stats.recovery_checkpoints_received,
+            checkpoint_receiver_stats.recovery_checkpoint_acks_sent,
+            checkpoint_source_stats.recovery_checkpoint_acks_received,
+            checkpoint_source_stats.recovery_cache_releases,
+            checkpoint_source_stats.track_ends_sent,
+            checkpoint_receiver_stats.track_ends_received);
     transport_destroy(client);
     transport_destroy(server);
     return 1;

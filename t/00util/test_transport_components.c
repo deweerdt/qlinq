@@ -146,20 +146,20 @@ int main(void) {
                          .size = sizeof(object_data),
                          .priority = 2};
   transport_sent_cache_t sent_cache = {0};
-  CHECK(transport_sent_cache_store(&sent_cache, &object, 3, 2, 2),
+  CHECK(transport_sent_cache_store(&sent_cache, &object, 3, 2, 2, true),
         "sent-object cache store");
   sent_object_cache_t *cached =
       transport_sent_cache_find(&sent_cache, &track, 10, 20);
   CHECK(cached && cached->size == sizeof(object_data) && cached->data[3] == 4,
         "sent-object cache roundtrip");
   size_t next_cache_entry = sent_cache.next_entry;
-  CHECK(transport_sent_cache_store(&sent_cache, &object, 4, 2, 2) &&
+  CHECK(transport_sent_cache_store(&sent_cache, &object, 4, 2, 2, true) &&
             sent_cache.next_entry == next_cache_entry &&
             cached->total_symbols == 4,
         "publication retry reuses sent-object cache identity");
   const uint8_t conflicting_data[] = {4, 3, 2, 1};
   object.data = conflicting_data;
-  CHECK(!transport_sent_cache_store(&sent_cache, &object, 4, 2, 2),
+  CHECK(!transport_sent_cache_store(&sent_cache, &object, 4, 2, 2, true),
         "conflicting sent-object identity rejected");
   object.data = object_data;
   moq_track_id_t different_profile = track;
@@ -191,7 +191,8 @@ int main(void) {
   moq_object_t rateless_object = object;
   rateless_object.track_id = rateless_track;
   transport_sent_cache_t rateless_cache = {0};
-  CHECK(transport_sent_cache_store(&rateless_cache, &rateless_object, 2, 2, 2),
+  CHECK(transport_sent_cache_store(&rateless_cache, &rateless_object, 2, 2, 2,
+                                   true),
         "rateless sent-object cache store");
   sent_object_cache_t *rateless_cached = transport_sent_cache_find(
       &rateless_cache, &rateless_track, object.group_id, object.object_id);
@@ -280,6 +281,26 @@ int main(void) {
   transport_fec_cache_destroy(&repair_fec_cache);
   transport_sent_cache_destroy(&rateless_cache);
   transport_sent_cache_destroy(&sent_cache);
+
+  transport_sent_cache_t bounded_cache = {0};
+  for (uint64_t object_id = 0; object_id < TRANSPORT_SENT_CACHE_SIZE;
+       object_id++) {
+    object.object_id = object_id;
+    CHECK(transport_sent_cache_store(&bounded_cache, &object, 3, 2, 2, false),
+          "bounded sent-object cache fill");
+  }
+  object.object_id = TRANSPORT_SENT_CACHE_SIZE;
+  CHECK(!transport_sent_cache_has_space(&bounded_cache) &&
+            !transport_sent_cache_store(&bounded_cache, &object, 3, 2, 2,
+                                        false),
+        "unacknowledged cache refuses overwrite");
+  CHECK(transport_sent_cache_release_through(&bounded_cache, &track, 10, 127) ==
+                128 &&
+            transport_sent_cache_has_space(&bounded_cache) &&
+            transport_sent_cache_store(&bounded_cache, &object, 3, 2, 2,
+                                       false),
+        "checkpoint release restores bounded cache capacity");
+  transport_sent_cache_destroy(&bounded_cache);
 
   transport_fec_cache_t fec_cache = {0};
   fec_t *fec = transport_fec_cache_get(&fec_cache, FEC_REED_SOLOMON, 2, 1, 8);

@@ -19,5 +19,14 @@ bool transport_stream_write_track_frame(quicly_stream_t *stream, uint8_t type,
                                         const moq_track_id_t *track_id);
 bool transport_stream_write_object_frame(quicly_stream_t *stream, uint8_t alias,
                                          const moq_object_t *object);
+bool transport_stream_write_track_end_frame(quicly_stream_t *stream,
+                                            uint8_t alias, uint64_t group_id,
+                                            uint64_t final_object_id);
+bool transport_stream_write_track_checkpoint_frame(
+    quicly_stream_t *stream, uint8_t alias, uint64_t group_id,
+    uint64_t first_object_id, uint64_t final_object_id, bool baseline);
+bool transport_stream_write_track_checkpoint_ack_frame(
+    quicly_stream_t *stream, uint8_t alias, uint64_t group_id,
+    uint64_t final_object_id);
 
 #endif

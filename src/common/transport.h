@@ -194,6 +194,10 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
  * or had no eligible recipients. */
 bool transport_publish(transport_t *t, const moq_object_t *obj);
 
+/* Flush buffered rateless data and reliably announce the last internal FEC
+ * object, allowing receivers to discover a wholly unseen tail. */
+bool transport_finish_track(transport_t *t, moq_track_id_t track_id);
+
 /* subscribe to a media track (client-side) */
 bool transport_subscribe(transport_t *t, moq_track_id_t track_id);
 
@@ -255,6 +259,16 @@ typedef struct {
   uint64_t repair_symbols_sent;
   uint64_t repair_rateless_symbols_sent;
   uint64_t repair_rateless_exhausted;
+  uint64_t track_ends_sent;
+  uint64_t track_ends_received;
+  uint64_t recovery_checkpoints_sent;
+  uint64_t recovery_checkpoints_received;
+  uint64_t recovery_checkpoint_acks_sent;
+  uint64_t recovery_checkpoint_acks_received;
+  uint64_t recovery_cache_releases;
+  uint64_t recovery_cache_backpressure;
+  size_t recovery_checkpoints_pending;
+  uint64_t recovery_oldest_checkpoint_age_ms;
   uint64_t events_emitted;
   uint64_t api_thread_violations;
   uint64_t recursive_tick_rejections;

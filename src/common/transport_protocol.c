@@ -1,6 +1,7 @@
 #include "transport_protocol.h"
 
 #include "fec.h"
+#include "transport_publish.h"
 #include "transport_repair.h"
 #include "transport_stream.h"
 #include "transport_wire.h"
@@ -24,7 +25,8 @@ static uint32_t local_capabilities(void) {
   return QLINQ_WIRE_CAP_RELIABLE | QLINQ_WIRE_CAP_DATAGRAM |
          QLINQ_WIRE_CAP_FEC_REED_SOLOMON | QLINQ_WIRE_CAP_FEC_RATELESS |
          QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION |
-         QLINQ_WIRE_CAP_RATELESS_REPAIR;
+         QLINQ_WIRE_CAP_RATELESS_REPAIR |
+         QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS;
 }
 
 bool transport_protocol_send_hello(transport_conn_t *conn) {
@@ -132,6 +134,17 @@ static bool object_was_delivered(const transport_object_gap_state_t *state,
           (UINT64_C(1) << (distance % 64U))) != 0;
 }
 
+static bool
+object_is_recently_delivered(const transport_object_gap_state_t *state,
+                             uint64_t object_id) {
+  if (!state->delivered_initialized || object_id > state->largest_delivered)
+    return false;
+  uint64_t distance = state->largest_delivered - object_id;
+  return distance < QLINQ_RECOVERY_HISTORY_OBJECTS &&
+         (state->delivered_mask[distance / 64U] &
+          (UINT64_C(1) << (distance % 64U))) != 0;
+}
+
 static void mark_object_delivered(transport_object_gap_state_t *state,
                                   uint64_t object_id) {
   if (!state->delivered_initialized) {
@@ -163,6 +176,120 @@ static void mark_object_delivered(transport_object_gap_state_t *state,
     if (distance < QLINQ_RECOVERY_HISTORY_OBJECTS)
       state->delivered_mask[distance / 64U] |= UINT64_C(1) << (distance % 64U);
   }
+}
+
+static bool send_checkpoint_ack(transport_conn_t *conn, uint8_t alias,
+                                uint64_t group_id, uint64_t final_object_id) {
+  if (!conn ||
+      (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) == 0 ||
+      !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate))
+    return false;
+  if (!transport_stream_write_track_checkpoint_ack_frame(
+          conn->stream, alias, group_id, final_object_id))
+    return false;
+  conn->transport->stats.recovery_checkpoint_acks_sent++;
+  return true;
+}
+
+static transport_recovery_window_t *
+find_recovery_window(transport_object_gap_state_t *state, uint64_t group_id,
+                     uint64_t first_object_id, uint64_t final_object_id) {
+  for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++) {
+    transport_recovery_window_t *window = &state->recovery_windows[i];
+    if (window->active && window->group_id == group_id &&
+        window->first_object_id == first_object_id &&
+        window->final_object_id == final_object_id)
+      return window;
+  }
+  return NULL;
+}
+
+static bool acknowledge_completed_recovery_windows(transport_conn_t *conn,
+                                                   uint8_t alias) {
+  transport_object_gap_state_t *state = &conn->object_gaps[alias];
+  while (true) {
+    transport_recovery_window_t *first = NULL;
+    for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++) {
+      transport_recovery_window_t *window = &state->recovery_windows[i];
+      if (!window->active ||
+          (first && window->first_object_id >= first->first_object_id))
+        continue;
+      first = window;
+    }
+    if (!first || first->missing_mask != 0)
+      return true;
+    if (!send_checkpoint_ack(conn, alias, first->group_id,
+                             first->final_object_id))
+      return false;
+    memset(first, 0, sizeof(*first));
+  }
+}
+
+static bool receive_recovery_checkpoint(transport_conn_t *conn, uint8_t alias,
+                                        uint64_t group_id,
+                                        uint64_t first_object_id,
+                                        uint64_t final_object_id,
+                                        bool acknowledge) {
+  if (!conn || first_object_id > final_object_id ||
+      final_object_id - first_object_id >= QLINQ_RECOVERY_WINDOW_OBJECTS)
+    return false;
+  transport_object_gap_state_t *state = &conn->object_gaps[alias];
+  if (find_recovery_window(state, group_id, first_object_id, final_object_id))
+    return true;
+
+  if (state->checkpoint_initialized) {
+    if (final_object_id <= state->last_checkpoint_object_id)
+      return !acknowledge ||
+             send_checkpoint_ack(conn, alias, group_id, final_object_id);
+    if (state->last_checkpoint_object_id == UINT64_MAX ||
+        first_object_id != state->last_checkpoint_object_id + 1U)
+      return false;
+  }
+
+  transport_recovery_window_t *window = NULL;
+  for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++) {
+    if (!state->recovery_windows[i].active) {
+      window = &state->recovery_windows[i];
+      break;
+    }
+  }
+  if (!window)
+    return false;
+
+  memset(window, 0, sizeof(*window));
+  window->group_id = group_id;
+  window->first_object_id = first_object_id;
+  window->final_object_id = final_object_id;
+  window->last_request_ms = transport_get_time_ms();
+  uint32_t count = (uint32_t)(final_object_id - first_object_id + 1U);
+  for (uint32_t bit = 0; bit < count; bit++)
+    if (!object_is_recently_delivered(state, first_object_id + bit))
+      window->missing_mask |= 1U << bit;
+
+  state->checkpoint_initialized = true;
+  state->last_checkpoint_object_id = final_object_id;
+  window->active = true;
+  if (!acknowledge) {
+    if (window->missing_mask == 0)
+      memset(window, 0, sizeof(*window));
+    return true;
+  }
+  return acknowledge_completed_recovery_windows(conn, alias);
+}
+
+static void recovery_mark_delivered(transport_conn_t *conn, uint8_t alias,
+                                    uint64_t group_id, uint64_t object_id) {
+  transport_object_gap_state_t *state = &conn->object_gaps[alias];
+  for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++) {
+    transport_recovery_window_t *window = &state->recovery_windows[i];
+    if (!window->active || window->group_id != group_id ||
+        object_id < window->first_object_id ||
+        object_id > window->final_object_id)
+      continue;
+    window->missing_mask &=
+        ~(1U << (uint32_t)(object_id - window->first_object_id));
+  }
+  (void)acknowledge_completed_recovery_windows(conn, alias);
 }
 
 static bool queue_missing_objects(transport_object_gap_state_t *state,
@@ -280,7 +407,11 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                        "protocol error: too many tracks");
           break;
         }
+        transport_publish_checkpoint_member_added(t, conn, &parsed_track,
+                                                  alias);
       } else if (type == QLINQ_WIRE_UNSUBSCRIBE) {
+        transport_publish_checkpoint_member_removed(t, conn, &parsed_track,
+                                                    alias);
         transport_subscriptions_remove(&conn->subscriptions,
                                        (moq_track_type_t)track_type,
                                        wire_track.name);
@@ -511,6 +642,112 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
           }
         }
       }
+      quicly_streambuf_ingress_shift(stream, frame.consumed);
+    } else if (type == QLINQ_WIRE_TRACK_CHECKPOINT) {
+      qlinq_wire_track_checkpoint_t checkpoint;
+      moq_track_id_t resolved_track;
+      if (!conn->authenticated ||
+          (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) ==
+              0 ||
+          qlinq_wire_decode_track_checkpoint(input.base, input.len,
+                                             &checkpoint) != QLINQ_WIRE_OK ||
+          transport_subscriptions_find_by_alias(
+              &conn->subscriptions, checkpoint.alias, &resolved_track) != 0 ||
+          resolved_track.type != MOQ_TRACK_DATA ||
+          (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0) {
+        quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                     "protocol error: invalid recovery checkpoint");
+        break;
+      }
+      if ((checkpoint.flags & QLINQ_WIRE_CHECKPOINT_BASELINE) != 0) {
+        transport_object_gap_state_t *gap =
+            &conn->object_gaps[checkpoint.alias];
+        if (checkpoint.first_object_id != checkpoint.final_object_id ||
+            (gap->checkpoint_initialized &&
+             checkpoint.final_object_id < gap->last_checkpoint_object_id) ||
+            !send_checkpoint_ack(conn, checkpoint.alias, checkpoint.group_id,
+                                 checkpoint.final_object_id)) {
+          quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                       "protocol error: invalid recovery baseline");
+          break;
+        }
+        gap->checkpoint_initialized = true;
+        gap->last_checkpoint_object_id = checkpoint.final_object_id;
+      } else if (!receive_recovery_checkpoint(
+                     conn, checkpoint.alias, checkpoint.group_id,
+                     checkpoint.first_object_id, checkpoint.final_object_id,
+                     true)) {
+        quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                     "protocol error: invalid recovery checkpoint window");
+        break;
+      }
+      t->stats.recovery_checkpoints_received++;
+      quicly_streambuf_ingress_shift(stream, frame.consumed);
+    } else if (type == QLINQ_WIRE_TRACK_CHECKPOINT_ACK) {
+      qlinq_wire_track_checkpoint_ack_t ack;
+      moq_track_id_t resolved_track;
+      if (!conn->authenticated ||
+          qlinq_wire_decode_track_checkpoint_ack(input.base, input.len, &ack) !=
+              QLINQ_WIRE_OK ||
+          transport_subscriptions_find_by_alias(&conn->subscriptions, ack.alias,
+                                                &resolved_track) != 0 ||
+          resolved_track.type != MOQ_TRACK_DATA ||
+          (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0 ||
+          !transport_publish_checkpoint_acked(t, conn, &ack, &resolved_track)) {
+        quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                     "protocol error: invalid recovery checkpoint ACK");
+        break;
+      }
+      t->stats.recovery_checkpoint_acks_received++;
+      quicly_streambuf_ingress_shift(stream, frame.consumed);
+    } else if (type == QLINQ_WIRE_TRACK_END) {
+      qlinq_wire_track_end_t end;
+      moq_track_id_t resolved_track;
+      if (!conn->authenticated ||
+          qlinq_wire_decode_track_end(input.base, input.len, &end) !=
+              QLINQ_WIRE_OK ||
+          transport_subscriptions_find_by_alias(&conn->subscriptions, end.alias,
+                                                &resolved_track) != 0 ||
+          resolved_track.type != MOQ_TRACK_DATA ||
+          (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0) {
+        quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                     "protocol error: invalid track completion");
+        break;
+      }
+
+      transport_object_gap_state_t *gap = &conn->object_gaps[end.alias];
+      bool acknowledge =
+          (conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) != 0;
+      uint64_t first_object_id = 0;
+      if (acknowledge && gap->checkpoint_initialized) {
+        if (end.final_object_id <= gap->last_checkpoint_object_id) {
+          bool outstanding = false;
+          for (size_t i = 0; i < QLINQ_RECOVERY_MAX_WINDOWS; i++)
+            outstanding |= gap->recovery_windows[i].active;
+          if (!outstanding &&
+              !send_checkpoint_ack(conn, end.alias, end.group_id,
+                                   end.final_object_id)) {
+            quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                         "protocol error: completion ACK failed");
+            break;
+          }
+          t->stats.track_ends_received++;
+          quicly_streambuf_ingress_shift(stream, frame.consumed);
+          continue;
+        }
+        first_object_id = gap->last_checkpoint_object_id + 1U;
+      } else {
+        first_object_id =
+            end.final_object_id >= 31 ? end.final_object_id - 31 : 0;
+      }
+      if (!receive_recovery_checkpoint(conn, end.alias, end.group_id,
+                                       first_object_id, end.final_object_id,
+                                       acknowledge)) {
+        quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                     "protocol error: invalid track completion window");
+        break;
+      }
+      t->stats.track_ends_received++;
       quicly_streambuf_ingress_shift(stream, frame.consumed);
     } else {
       quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
@@ -1017,8 +1254,10 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
                                          .size = original_size,
                                          .is_keyframe = (is_keyframe != 0),
                                          .priority = asm_slot->priority}};
-      if (rateless_data)
+      if (rateless_data) {
         mark_object_delivered(object_state, object_id);
+        recovery_mark_delivered(tconn, track_id, group_id, object_id);
+      }
       t->stats.fec_objects_recovered++;
       transport_emit_event(t, &ev);
       free(full_data);

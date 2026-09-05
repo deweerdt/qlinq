@@ -717,20 +717,60 @@ void transport_tick(transport_t *t) {
     for (size_t alias = 0; alias <= UINT8_MAX && object_nack_budget > 0;
          alias++) {
       transport_object_gap_state_t *gap = &conn->object_gaps[alias];
-      if (gap->pending_mask == 0 ||
-          now_nack_ms - gap->detected_at_ms < QLINQ_FEC_NACK_DELAY_MS)
-        continue;
-      for (uint32_t bit = 0; bit < 32 && object_nack_budget > 0; bit++) {
-        if ((gap->pending_mask & (1U << bit)) == 0)
+      if (gap->pending_mask != 0 &&
+          now_nack_ms - gap->detected_at_ms >= QLINQ_FEC_NACK_DELAY_MS) {
+        for (uint32_t bit = 0; bit < 32 && object_nack_budget > 0; bit++) {
+          if ((gap->pending_mask & (1U << bit)) == 0)
+            continue;
+          if (transport_protocol_send_nack(
+                  conn, (uint8_t)alias, gap->group_id, gap->pending_base + bit,
+                  NULL, 0, true)) {
+            gap->detected_at_ms = now_nack_ms;
+            object_nack_budget--;
+          } else {
+            break;
+          }
+        }
+      }
+
+      for (size_t window_index = 0;
+           window_index < QLINQ_RECOVERY_MAX_WINDOWS && object_nack_budget > 0;
+           window_index++) {
+        transport_recovery_window_t *window =
+            &gap->recovery_windows[window_index];
+        if (!window->active || window->missing_mask == 0 ||
+            now_nack_ms - window->last_request_ms <
+                QLINQ_FEC_COMPLETION_RETRY_MS)
           continue;
-        if (transport_protocol_send_nack(
-                conn, (uint8_t)alias, gap->group_id, gap->pending_base + bit,
-                NULL, 0, true)) {
-          /* Keep the gap pending until a symbol arrives. A NACK being queued
-           * does not guarantee that its repair will be admitted or delivered. */
-          gap->detected_at_ms = now_nack_ms;
-          object_nack_budget--;
-        } else {
+        for (uint32_t attempt = 0; attempt < QLINQ_RECOVERY_WINDOW_OBJECTS;
+             attempt++) {
+          uint32_t bit =
+              (window->cursor + attempt) % QLINQ_RECOVERY_WINDOW_OBJECTS;
+          if ((window->missing_mask & (1U << bit)) == 0)
+            continue;
+          uint64_t object_id = window->first_object_id + bit;
+          if (object_id > window->final_object_id)
+            continue;
+          bool assembling = false;
+          for (size_t i = 0; i < t->limits.max_assemblers_per_connection; i++) {
+            frame_assembler_t *assembler = &conn->assemblers[i];
+            if (assembler->total_symbols > 0 && assembler->track_id == alias &&
+                assembler->group_id == window->group_id &&
+                assembler->object_id == object_id) {
+              assembling = true;
+              break;
+            }
+          }
+          if (assembling)
+            continue;
+          if (transport_protocol_send_nack(conn, (uint8_t)alias,
+                                           window->group_id, object_id, NULL, 0,
+                                           true)) {
+            window->cursor =
+                (uint8_t)((bit + 1U) % QLINQ_RECOVERY_WINDOW_OBJECTS);
+            window->last_request_ms = now_nack_ms;
+            object_nack_budget--;
+          }
           break;
         }
       }
@@ -1216,6 +1256,7 @@ void transport_tick(transport_t *t) {
         transport_emit_event(t, &ev);
         t->stats.connections_closed++;
 
+        transport_publish_checkpoint_connection_removed(t, conn);
         quicly_free(conn->quic);
         for (size_t a = 0; a < t->limits.max_assemblers_per_connection; a++)
           transport_release_assembler(t, &conn->assemblers[a]);
@@ -1276,6 +1317,7 @@ bool transport_subscribe(transport_t *t, moq_track_id_t track_id) {
       if (!transport_stream_write_track_frame(
               conn->stream, QLINQ_WIRE_SUBSCRIBE, alias, &track_id))
         return false;
+      transport_publish_checkpoint_member_added(t, conn, &track_id, alias);
     }
     return true;
   }
@@ -1307,8 +1349,12 @@ bool transport_subscribe(transport_t *t, moq_track_id_t track_id) {
       return false;
   }
 
-  return transport_stream_write_track_frame(
-      t->client_conn->stream, QLINQ_WIRE_SUBSCRIBE, alias, &track_id);
+  if (!transport_stream_write_track_frame(
+          t->client_conn->stream, QLINQ_WIRE_SUBSCRIBE, alias, &track_id))
+    return false;
+  transport_publish_checkpoint_member_added(t, t->client_conn, &track_id,
+                                            alias);
+  return true;
 }
 
 bool transport_request_keyframe(transport_t *t, moq_track_id_t track_id) {
@@ -1417,6 +1463,31 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
   stats->active_connections =
       t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
   stats->assembler_memory_bytes = t->assembler_memory_bytes;
+  int64_t now_ms = transport_get_time_ms();
+  size_t active_count =
+      t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  for (size_t i = 0; i < active_count; i++) {
+    const transport_conn_t *conn =
+        t->is_server ? t->conns[i] : t->client_conn;
+    if (!conn)
+      continue;
+    for (size_t alias = 0; alias <= UINT8_MAX; alias++) {
+      const transport_checkpoint_ack_state_t *ack =
+          &conn->checkpoint_acks[alias];
+      if (!ack->participating || !ack->sent_initialized ||
+          (ack->acked_initialized &&
+           ack->acked_group_id == ack->sent_group_id &&
+           ack->acked_object_id >= ack->sent_object_id))
+        continue;
+      stats->recovery_checkpoints_pending++;
+      if (ack->oldest_unacked_sent_at_ms > 0 &&
+          now_ms > ack->oldest_unacked_sent_at_ms &&
+          (uint64_t)(now_ms - ack->oldest_unacked_sent_at_ms) >
+              stats->recovery_oldest_checkpoint_age_ms)
+        stats->recovery_oldest_checkpoint_age_ms =
+            (uint64_t)(now_ms - ack->oldest_unacked_sent_at_ms);
+    }
+  }
   for (size_t i = 0; i < t->num_fds; i++) {
     const transport_egress_t *egress = &t->egress[i];
     stats->udp_packets_sent += egress->packets_sent;

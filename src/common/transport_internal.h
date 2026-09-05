@@ -21,8 +21,22 @@
 #define QLINQ_FEC_ASSEMBLER_TIMEOUT_MS 2000
 #define QLINQ_FEC_NACK_DELAY_MS 25
 #define QLINQ_FEC_REPAIR_DEDUP_MS 25
+#define QLINQ_FEC_COMPLETION_RETRY_MS 500
+#define QLINQ_RECOVERY_WINDOW_OBJECTS 32U
+#define QLINQ_RECOVERY_MAX_WINDOWS 8U
 #define QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY 256U
-#define QLINQ_RECOVERY_HISTORY_OBJECTS 256U
+#define QLINQ_RECOVERY_HISTORY_OBJECTS                                         \
+  (QLINQ_RECOVERY_WINDOW_OBJECTS * QLINQ_RECOVERY_MAX_WINDOWS)
+
+typedef struct {
+  bool active;
+  uint64_t group_id;
+  uint64_t first_object_id;
+  uint64_t final_object_id;
+  uint32_t missing_mask;
+  uint8_t cursor;
+  int64_t last_request_ms;
+} transport_recovery_window_t;
 
 typedef struct {
   uint64_t last_seen;
@@ -34,7 +48,31 @@ typedef struct {
   uint64_t largest_delivered;
   uint64_t delivered_mask[QLINQ_RECOVERY_HISTORY_OBJECTS / 64U];
   bool delivered_initialized;
+  bool checkpoint_initialized;
+  uint64_t last_checkpoint_object_id;
+  transport_recovery_window_t recovery_windows[QLINQ_RECOVERY_MAX_WINDOWS];
 } transport_object_gap_state_t;
+
+typedef struct {
+  moq_track_id_t track_id;
+  uint64_t next_object_id;
+  bool active;
+  bool has_objects;
+  bool checkpoint_initialized;
+  uint64_t checkpoint_group_id;
+  uint64_t last_checkpoint_object_id;
+} transport_fec_track_state_t;
+
+typedef struct {
+  bool participating;
+  bool sent_initialized;
+  uint64_t sent_group_id;
+  uint64_t sent_object_id;
+  int64_t oldest_unacked_sent_at_ms;
+  bool acked_initialized;
+  uint64_t acked_group_id;
+  uint64_t acked_object_id;
+} transport_checkpoint_ack_state_t;
 
 struct transport_t {
   transport_callback_t callback;
@@ -85,10 +123,10 @@ struct transport_t {
   size_t fec_buf_cap;
   uint64_t fec_first_pkt_time;
   moq_track_id_t fec_track_id;
-  uint64_t fec_object_id;
   uint32_t fec_pkt_count;
   uint8_t fec_priority;
   bool fec_in_flush;
+  transport_fec_track_state_t fec_tracks[TRANSPORT_HARD_MAX_SUBSCRIPTIONS];
 
   ifmon_watcher_t ifmon_w;
   int ifmon_pipe[2];
@@ -126,6 +164,7 @@ struct transport_conn_t {
   bool path_state_overridden[TRANSPORT_MAX_PATHS];
   transport_repair_limiter_t repair_request_limiter;
   transport_repair_limiter_t nack_request_limiter;
+  transport_checkpoint_ack_state_t checkpoint_acks[UINT8_MAX + 1U];
   int64_t last_repair_ms;
   uint64_t last_repair_group_id;
   uint64_t last_repair_object_id;

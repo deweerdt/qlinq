@@ -36,10 +36,17 @@ sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
                                                const moq_track_id_t *track,
                                                uint64_t group_id,
                                                uint64_t object_id);
+bool transport_sent_cache_has_space(const transport_sent_cache_t *cache);
 bool transport_sent_cache_store(transport_sent_cache_t *cache,
                                 const moq_object_t *object,
                                 uint16_t total_symbols, uint16_t data_symbols,
-                                uint16_t symbol_size);
+                                uint16_t symbol_size, bool allow_evict);
+size_t transport_sent_cache_release_through(transport_sent_cache_t *cache,
+                                            const moq_track_id_t *track,
+                                            uint64_t group_id,
+                                            uint64_t object_id);
+size_t transport_sent_cache_release_track(transport_sent_cache_t *cache,
+                                          const moq_track_id_t *track);
 void transport_sent_cache_destroy(transport_sent_cache_t *cache);
 
 typedef struct {

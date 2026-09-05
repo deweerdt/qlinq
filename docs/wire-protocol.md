@@ -37,6 +37,11 @@ a 20-byte metadata header followed by application data.
 | 7 | Reliable track object | Object metadata followed by object bytes |
 | 8 | NACK | NACK descriptor |
 | 9 | HELLO | Capability and resource-limit advertisement |
+| 10 | Reserved | Experimental Flexicast branch; rejected here |
+| 11 | Track completion | Alias, group ID, and final FEC object ID |
+| 12 | Recovery checkpoint | Alias, group ID, first and final FEC object IDs |
+| 13 | Recovery checkpoint ACK | Alias, group ID, and final FEC object ID |
+| 14–255 | Reserved | Rejected by this version |
 
 `HELLO` is the first frame on the bidirectional control stream in each
 direction. Application control frames and the public connected event are gated
@@ -58,8 +63,9 @@ The HELLO payload is 20 bytes:
 
 Defined capabilities are reliable objects (`0x01`), datagrams (`0x02`),
 Reed-Solomon FEC (`0x04`), rateless FEC (`0x08`), multipath (`0x10`),
-application authentication (`0x20`), and degree-of-freedom rateless repair
-(`0x100`). Unknown capability bits, duplicate HELLO frames, a peer with the
+application authentication (`0x20`), rolling recovery checkpoints (`0x80`),
+and degree-of-freedom rateless repair (`0x100`). Unknown capability bits,
+duplicate HELLO frames, a peer with the
 wrong role, or an application frame before HELLO are protocol errors. Each
 connection uses the lower local/peer object, subscription, and UDP-payload
 limits.
@@ -83,6 +89,18 @@ to its bounded datagram queue. Once the 1,024-symbol ESI namespace is
 exhausted, it cycles retained systematic symbols so recovery remains possible
 without unbounded sender state. Per-peer and source-wide token buckets bound
 repair request load.
+
+Checkpoint-capable rateless publishers send a reliable 28-byte recovery
+checkpoint after every 32 internal FEC objects. The receiver retains at most
+eight outstanding windows and requests absent objects one at a time every 500
+milliseconds. Once every object in a window is delivered, it returns a
+reliable 17-byte cumulative checkpoint ACK.
+
+`transport_finish_track` flushes grouped data and sends a 17-byte track
+completion marker. For checkpoint-capable peers it is the final checkpoint and
+uses the same ACK. The source protects cached objects from eviction until every
+subscribed capable peer has acknowledged them; a full 256-object protected
+cache applies publication backpressure instead of discarding repair state.
 
 Reliable-object metadata contains an alias, keyframe flag, priority, one
 reserved zero byte, 64-bit group ID, and 64-bit object ID. Each unidirectional

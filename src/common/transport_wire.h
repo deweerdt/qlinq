@@ -11,10 +11,14 @@
 #define QLINQ_WIRE_FEC_HEADER_SIZE 44U
 #define QLINQ_WIRE_TELEMETRY_SIZE 24U
 #define QLINQ_WIRE_HELLO_SIZE 20U
+#define QLINQ_WIRE_TRACK_END_SIZE 17U
+#define QLINQ_WIRE_TRACK_CHECKPOINT_SIZE 28U
+#define QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE 17U
 #define QLINQ_WIRE_MAX_TRACK_NAME 63U
 #define QLINQ_WIRE_MAX_NACK_SYMBOLS 1024U
 #define QLINQ_WIRE_NACK_WHOLE_OBJECT 0x01U
 #define QLINQ_WIRE_NACK_RATELESS 0x02U
+#define QLINQ_WIRE_CHECKPOINT_BASELINE 0x01U
 
 typedef enum {
   QLINQ_WIRE_OK = 0,
@@ -33,7 +37,11 @@ typedef enum {
   QLINQ_WIRE_KEYFRAME_REQUEST = 6,
   QLINQ_WIRE_TRACK_OBJECT = 7,
   QLINQ_WIRE_NACK = 8,
-  QLINQ_WIRE_HELLO = 9
+  QLINQ_WIRE_HELLO = 9,
+  /* Type 10 is reserved for the experimental Flexicast branch. */
+  QLINQ_WIRE_TRACK_END = 11,
+  QLINQ_WIRE_TRACK_CHECKPOINT = 12,
+  QLINQ_WIRE_TRACK_CHECKPOINT_ACK = 13
 } qlinq_wire_frame_type_t;
 
 #define QLINQ_WIRE_ROLE_CLIENT 0U
@@ -45,11 +53,13 @@ typedef enum {
 #define QLINQ_WIRE_CAP_FEC_RATELESS 0x00000008U
 #define QLINQ_WIRE_CAP_MULTIPATH 0x00000010U
 #define QLINQ_WIRE_CAP_AUTHENTICATION 0x00000020U
+#define QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS 0x00000080U
 #define QLINQ_WIRE_CAP_RATELESS_REPAIR 0x00000100U
 #define QLINQ_WIRE_CAP_KNOWN                                                   \
   (QLINQ_WIRE_CAP_RELIABLE | QLINQ_WIRE_CAP_DATAGRAM |                         \
    QLINQ_WIRE_CAP_FEC_REED_SOLOMON | QLINQ_WIRE_CAP_FEC_RATELESS |             \
    QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION |                 \
+   QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS |                                      \
    QLINQ_WIRE_CAP_RATELESS_REPAIR)
 
 typedef enum {
@@ -119,6 +129,26 @@ typedef struct {
   uint16_t max_datagram_size;
 } qlinq_wire_hello_t;
 
+typedef struct {
+  uint8_t alias;
+  uint64_t group_id;
+  uint64_t final_object_id;
+} qlinq_wire_track_end_t;
+
+typedef struct {
+  uint8_t alias;
+  uint8_t flags;
+  uint64_t group_id;
+  uint64_t first_object_id;
+  uint64_t final_object_id;
+} qlinq_wire_track_checkpoint_t;
+
+typedef struct {
+  uint8_t alias;
+  uint64_t group_id;
+  uint64_t final_object_id;
+} qlinq_wire_track_checkpoint_ack_t;
+
 bool qlinq_wire_frame_type_is_known(uint8_t type);
 
 qlinq_wire_result_t
@@ -178,5 +208,23 @@ qlinq_wire_result_t qlinq_wire_encode_hello(uint8_t *dst, size_t capacity,
                                             const qlinq_wire_hello_t *hello);
 qlinq_wire_result_t qlinq_wire_decode_hello(const uint8_t *src, size_t len,
                                             qlinq_wire_hello_t *hello);
+
+qlinq_wire_result_t
+qlinq_wire_encode_track_end(uint8_t *dst, size_t capacity,
+                            const qlinq_wire_track_end_t *end);
+qlinq_wire_result_t qlinq_wire_decode_track_end(const uint8_t *src, size_t len,
+                                                qlinq_wire_track_end_t *end);
+qlinq_wire_result_t qlinq_wire_encode_track_checkpoint(
+    uint8_t *dst, size_t capacity,
+    const qlinq_wire_track_checkpoint_t *checkpoint);
+qlinq_wire_result_t
+qlinq_wire_decode_track_checkpoint(const uint8_t *src, size_t len,
+                                   qlinq_wire_track_checkpoint_t *checkpoint);
+qlinq_wire_result_t qlinq_wire_encode_track_checkpoint_ack(
+    uint8_t *dst, size_t capacity,
+    const qlinq_wire_track_checkpoint_ack_t *ack);
+qlinq_wire_result_t
+qlinq_wire_decode_track_checkpoint_ack(const uint8_t *src, size_t len,
+                                       qlinq_wire_track_checkpoint_ack_t *ack);
 
 #endif

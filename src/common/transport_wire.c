@@ -53,7 +53,9 @@ static qlinq_wire_result_t check_envelope(const uint8_t *src, size_t len,
 }
 
 bool qlinq_wire_frame_type_is_known(uint8_t type) {
-  return type >= QLINQ_WIRE_SUBSCRIBE && type <= QLINQ_WIRE_HELLO;
+  return (type >= QLINQ_WIRE_SUBSCRIBE && type <= QLINQ_WIRE_HELLO) ||
+         (type >= QLINQ_WIRE_TRACK_END &&
+          type <= QLINQ_WIRE_TRACK_CHECKPOINT_ACK);
 }
 
 qlinq_wire_result_t
@@ -410,5 +412,88 @@ qlinq_wire_result_t qlinq_wire_decode_hello(const uint8_t *src, size_t len,
       hello->max_reliable_object_size == 0 || hello->max_fec_object_size == 0 ||
       (hello->capabilities & ~QLINQ_WIRE_CAP_KNOWN) != 0)
     return QLINQ_WIRE_INVALID;
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t
+qlinq_wire_encode_track_end(uint8_t *dst, size_t capacity,
+                            const qlinq_wire_track_end_t *end) {
+  if (!dst || !end)
+    return QLINQ_WIRE_INVALID;
+  if (capacity < QLINQ_WIRE_TRACK_END_SIZE)
+    return QLINQ_WIRE_TOO_LARGE;
+  dst[0] = end->alias;
+  write_u64(dst + 1, end->group_id);
+  write_u64(dst + 9, end->final_object_id);
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t qlinq_wire_decode_track_end(const uint8_t *src, size_t len,
+                                                qlinq_wire_track_end_t *end) {
+  if (!src || !end || len != QLINQ_WIRE_TRACK_END_SIZE)
+    return QLINQ_WIRE_INVALID;
+  end->alias = src[0];
+  end->group_id = read_u64(src + 1);
+  end->final_object_id = read_u64(src + 9);
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t qlinq_wire_encode_track_checkpoint(
+    uint8_t *dst, size_t capacity,
+    const qlinq_wire_track_checkpoint_t *checkpoint) {
+  if (!dst || !checkpoint ||
+      (checkpoint->flags & ~QLINQ_WIRE_CHECKPOINT_BASELINE) != 0 ||
+      checkpoint->first_object_id > checkpoint->final_object_id)
+    return QLINQ_WIRE_INVALID;
+  if (capacity < QLINQ_WIRE_TRACK_CHECKPOINT_SIZE)
+    return QLINQ_WIRE_TOO_LARGE;
+  dst[0] = checkpoint->alias;
+  dst[1] = checkpoint->flags;
+  dst[2] = 0;
+  dst[3] = 0;
+  write_u64(dst + 4, checkpoint->group_id);
+  write_u64(dst + 12, checkpoint->first_object_id);
+  write_u64(dst + 20, checkpoint->final_object_id);
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t
+qlinq_wire_decode_track_checkpoint(const uint8_t *src, size_t len,
+                                   qlinq_wire_track_checkpoint_t *checkpoint) {
+  if (!src || !checkpoint || len != QLINQ_WIRE_TRACK_CHECKPOINT_SIZE)
+    return QLINQ_WIRE_INVALID;
+  checkpoint->alias = src[0];
+  checkpoint->flags = src[1];
+  checkpoint->group_id = read_u64(src + 4);
+  checkpoint->first_object_id = read_u64(src + 12);
+  checkpoint->final_object_id = read_u64(src + 20);
+  return src[2] == 0 && src[3] == 0 &&
+                 (checkpoint->flags & ~QLINQ_WIRE_CHECKPOINT_BASELINE) == 0 &&
+                 checkpoint->first_object_id <= checkpoint->final_object_id
+             ? QLINQ_WIRE_OK
+             : QLINQ_WIRE_INVALID;
+}
+
+qlinq_wire_result_t qlinq_wire_encode_track_checkpoint_ack(
+    uint8_t *dst, size_t capacity,
+    const qlinq_wire_track_checkpoint_ack_t *ack) {
+  if (!dst || !ack)
+    return QLINQ_WIRE_INVALID;
+  if (capacity < QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE)
+    return QLINQ_WIRE_TOO_LARGE;
+  dst[0] = ack->alias;
+  write_u64(dst + 1, ack->group_id);
+  write_u64(dst + 9, ack->final_object_id);
+  return QLINQ_WIRE_OK;
+}
+
+qlinq_wire_result_t
+qlinq_wire_decode_track_checkpoint_ack(const uint8_t *src, size_t len,
+                                       qlinq_wire_track_checkpoint_ack_t *ack) {
+  if (!src || !ack || len != QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE)
+    return QLINQ_WIRE_INVALID;
+  ack->alias = src[0];
+  ack->group_id = read_u64(src + 1);
+  ack->final_object_id = read_u64(src + 9);
   return QLINQ_WIRE_OK;
 }

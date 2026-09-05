@@ -89,3 +89,46 @@ bool transport_stream_write_object_frame(quicly_stream_t *stream, uint8_t alias,
                                       sizeof(header), object->data,
                                       object->size);
 }
+
+bool transport_stream_write_track_end_frame(quicly_stream_t *stream,
+                                            uint8_t alias, uint64_t group_id,
+                                            uint64_t final_object_id) {
+  uint8_t payload[QLINQ_WIRE_TRACK_END_SIZE];
+  qlinq_wire_track_end_t end = {
+      .alias = alias, .group_id = group_id, .final_object_id = final_object_id};
+  if (qlinq_wire_encode_track_end(payload, sizeof(payload), &end) !=
+      QLINQ_WIRE_OK)
+    return false;
+  return transport_stream_write_frame(stream, QLINQ_WIRE_TRACK_END, payload,
+                                      sizeof(payload));
+}
+
+bool transport_stream_write_track_checkpoint_frame(
+    quicly_stream_t *stream, uint8_t alias, uint64_t group_id,
+    uint64_t first_object_id, uint64_t final_object_id, bool baseline) {
+  uint8_t payload[QLINQ_WIRE_TRACK_CHECKPOINT_SIZE];
+  qlinq_wire_track_checkpoint_t checkpoint = {
+      .alias = alias,
+      .flags = baseline ? QLINQ_WIRE_CHECKPOINT_BASELINE : 0,
+      .group_id = group_id,
+      .first_object_id = first_object_id,
+      .final_object_id = final_object_id};
+  if (qlinq_wire_encode_track_checkpoint(payload, sizeof(payload),
+                                         &checkpoint) != QLINQ_WIRE_OK)
+    return false;
+  return transport_stream_write_frame(stream, QLINQ_WIRE_TRACK_CHECKPOINT,
+                                      payload, sizeof(payload));
+}
+
+bool transport_stream_write_track_checkpoint_ack_frame(
+    quicly_stream_t *stream, uint8_t alias, uint64_t group_id,
+    uint64_t final_object_id) {
+  uint8_t payload[QLINQ_WIRE_TRACK_CHECKPOINT_ACK_SIZE];
+  qlinq_wire_track_checkpoint_ack_t ack = {
+      .alias = alias, .group_id = group_id, .final_object_id = final_object_id};
+  if (qlinq_wire_encode_track_checkpoint_ack(payload, sizeof(payload), &ack) !=
+      QLINQ_WIRE_OK)
+    return false;
+  return transport_stream_write_frame(stream, QLINQ_WIRE_TRACK_CHECKPOINT_ACK,
+                                      payload, sizeof(payload));
+}

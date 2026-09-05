@@ -30,10 +30,19 @@ sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
   return NULL;
 }
 
+bool transport_sent_cache_has_space(const transport_sent_cache_t *cache) {
+  if (!cache)
+    return false;
+  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++)
+    if (!cache->entries[i].data)
+      return true;
+  return false;
+}
+
 bool transport_sent_cache_store(transport_sent_cache_t *cache,
                                 const moq_object_t *object,
                                 uint16_t total_symbols, uint16_t data_symbols,
-                                uint16_t symbol_size) {
+                                uint16_t symbol_size, bool allow_evict) {
   if (!cache || !object || !object->data || object->size == 0)
     return false;
   sent_object_cache_t *existing = transport_sent_cache_find(
@@ -55,7 +64,21 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
     return true;
   }
 
-  sent_object_cache_t *entry = &cache->entries[cache->next_entry];
+  sent_object_cache_t *entry = NULL;
+  for (size_t offset = 0; offset < TRANSPORT_SENT_CACHE_SIZE; offset++) {
+    size_t index = (cache->next_entry + offset) % TRANSPORT_SENT_CACHE_SIZE;
+    if (!cache->entries[index].data) {
+      entry = &cache->entries[index];
+      cache->next_entry = (index + 1U) % TRANSPORT_SENT_CACHE_SIZE;
+      break;
+    }
+  }
+  if (!entry) {
+    if (!allow_evict)
+      return false;
+    entry = &cache->entries[cache->next_entry];
+    cache->next_entry = (cache->next_entry + 1U) % TRANSPORT_SENT_CACHE_SIZE;
+  }
   uint8_t *copy = malloc(object->size);
   if (!copy)
     return false;
@@ -74,8 +97,45 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   entry->next_repair_symbol = total_symbols;
   entry->next_systematic_repair_symbol = 0;
   entry->data = copy;
-  cache->next_entry = (cache->next_entry + 1U) % TRANSPORT_SENT_CACHE_SIZE;
   return true;
+}
+
+static void release_entry(sent_object_cache_t *entry) {
+  free(entry->data);
+  memset(entry, 0, sizeof(*entry));
+}
+
+size_t transport_sent_cache_release_through(transport_sent_cache_t *cache,
+                                            const moq_track_id_t *track,
+                                            uint64_t group_id,
+                                            uint64_t object_id) {
+  if (!cache || !track)
+    return 0;
+  size_t released = 0;
+  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
+    sent_object_cache_t *entry = &cache->entries[i];
+    if (entry->data && track_equal(&entry->track_id, track) &&
+        entry->group_id == group_id && entry->object_id <= object_id) {
+      release_entry(entry);
+      released++;
+    }
+  }
+  return released;
+}
+
+size_t transport_sent_cache_release_track(transport_sent_cache_t *cache,
+                                          const moq_track_id_t *track) {
+  if (!cache || !track)
+    return 0;
+  size_t released = 0;
+  for (size_t i = 0; i < TRANSPORT_SENT_CACHE_SIZE; i++) {
+    sent_object_cache_t *entry = &cache->entries[i];
+    if (entry->data && track_equal(&entry->track_id, track)) {
+      release_entry(entry);
+      released++;
+    }
+  }
+  return released;
 }
 
 void transport_sent_cache_destroy(transport_sent_cache_t *cache) {
