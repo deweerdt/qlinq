@@ -23,6 +23,8 @@ typedef struct {
   uint16_t total_symbols;
   uint16_t data_symbols;
   uint16_t symbol_size;
+  uint16_t next_repair_symbol;
+  uint16_t next_systematic_repair_symbol;
 } sent_object_cache_t;
 
 typedef struct {

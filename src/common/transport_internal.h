@@ -8,6 +8,7 @@
 #include "transport_fec_state.h"
 #include "transport_memory.h"
 #include "transport_paths.h"
+#include "transport_repair.h"
 #include "transport_subscriptions.h"
 
 #include "picotls.h"
@@ -74,6 +75,8 @@ struct transport_t {
   quicly_receive_datagram_frame_t receive_datagram;
 
   transport_sent_cache_t sent_cache;
+  transport_repair_mode_t repair_mode;
+  transport_repair_limiter_t aggregate_repair_limiter;
   uint8_t simulated_loss_rate;
   arena_t arena;
 
@@ -121,8 +124,8 @@ struct transport_conn_t {
   uint64_t last_telemetry_s_ns[TRANSPORT_MAX_PATHS];
   uint64_t last_telemetry_r_ns[TRANSPORT_MAX_PATHS];
   bool path_state_overridden[TRANSPORT_MAX_PATHS];
-  int64_t repair_window_start_ms;
-  uint16_t repair_requests_in_window;
+  transport_repair_limiter_t repair_request_limiter;
+  transport_repair_limiter_t nack_request_limiter;
   int64_t last_repair_ms;
   uint64_t last_repair_group_id;
   uint64_t last_repair_object_id;

@@ -1,7 +1,52 @@
 #include "transport_repair.h"
 
+#include <limits.h>
 #include <stdlib.h>
 #include <string.h>
+
+bool transport_repair_limiter_take(transport_repair_limiter_t *limiter,
+                                   size_t requests_per_second, int64_t now_ms) {
+  if (!limiter || requests_per_second == 0 ||
+      requests_per_second > UINT64_MAX / 1000U)
+    return false;
+  uint64_t capacity = (uint64_t)requests_per_second * 1000U;
+  if (limiter->last_refill_ms == 0 || now_ms < limiter->last_refill_ms) {
+    limiter->tokens_milli = capacity;
+    limiter->last_refill_ms = now_ms;
+  } else if (now_ms > limiter->last_refill_ms) {
+    uint64_t elapsed = (uint64_t)(now_ms - limiter->last_refill_ms);
+    uint64_t added = elapsed > UINT64_MAX / requests_per_second
+                         ? capacity
+                         : elapsed * (uint64_t)requests_per_second;
+    limiter->tokens_milli = added >= capacity - limiter->tokens_milli
+                                ? capacity
+                                : limiter->tokens_milli + added;
+    limiter->last_refill_ms = now_ms;
+  }
+  if (limiter->tokens_milli < 1000U)
+    return false;
+  limiter->tokens_milli -= 1000U;
+  return true;
+}
+
+size_t transport_repair_normalize_indices(uint16_t *indices, size_t count) {
+  if (!indices)
+    return 0;
+  for (size_t i = 1; i < count; i++) {
+    uint16_t value = indices[i];
+    size_t position = i;
+    while (position > 0 && indices[position - 1U] > value) {
+      indices[position] = indices[position - 1U];
+      position--;
+    }
+    indices[position] = value;
+  }
+  size_t unique = 0;
+  for (size_t i = 0; i < count; i++)
+    if (unique == 0 || indices[i] != indices[unique - 1U])
+      indices[unique++] = indices[i];
+  return unique;
+}
 
 void transport_repair_batch_destroy(transport_repair_batch_t *batch) {
   if (!batch)
@@ -134,5 +179,83 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
     return false;
   }
   batch->total_symbols = (uint16_t)total_symbols;
+  return true;
+}
+
+bool transport_repair_build_rateless(transport_fec_cache_t *fec_cache,
+                                     sent_object_cache_t *object,
+                                     size_t requested,
+                                     transport_repair_batch_t *batch) {
+  if (!fec_cache || !object || !batch ||
+      (object->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0 ||
+      requested == 0 || object->next_repair_symbol < object->data_symbols ||
+      object->next_repair_symbol >= QLINQ_FEC_MAX_TOTAL_SYMBOLS)
+    return false;
+  size_t available = QLINQ_FEC_MAX_TOTAL_SYMBOLS - object->next_repair_symbol;
+  size_t count = requested;
+  if (count > TRANSPORT_REPAIR_MAX_SYMBOLS)
+    count = TRANSPORT_REPAIR_MAX_SYMBOLS;
+  if (count > available)
+    count = available;
+  if (count == 0)
+    return false;
+  uint16_t indices[TRANSPORT_REPAIR_MAX_SYMBOLS];
+  for (size_t i = 0; i < count; i++)
+    indices[i] = (uint16_t)(object->next_repair_symbol + i);
+  return transport_repair_build(fec_cache, object, false, indices, count,
+                                batch);
+}
+
+bool transport_repair_commit_rateless(sent_object_cache_t *object,
+                                      const transport_repair_batch_t *batch,
+                                      size_t admitted) {
+  if (!object || !batch || admitted == 0 || admitted > batch->count ||
+      object->next_repair_symbol >= QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
+      admitted > QLINQ_FEC_MAX_TOTAL_SYMBOLS - object->next_repair_symbol)
+    return false;
+  for (size_t i = 0; i < admitted; i++)
+    if (batch->indices[i] != object->next_repair_symbol + i)
+      return false;
+  object->next_repair_symbol =
+      (uint16_t)(object->next_repair_symbol + admitted);
+  return true;
+}
+
+bool transport_repair_build_systematic_fallback(
+    transport_fec_cache_t *fec_cache, sent_object_cache_t *object,
+    size_t requested, transport_repair_batch_t *batch) {
+  if (!fec_cache || !object || !batch || requested == 0 ||
+      (object->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0 ||
+      object->next_repair_symbol < QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
+      object->data_symbols == 0 ||
+      object->next_systematic_repair_symbol >= object->data_symbols)
+    return false;
+  size_t count = requested;
+  if (count > TRANSPORT_REPAIR_MAX_SYMBOLS)
+    count = TRANSPORT_REPAIR_MAX_SYMBOLS;
+  if (count > object->data_symbols)
+    count = object->data_symbols;
+  uint16_t indices[TRANSPORT_REPAIR_MAX_SYMBOLS];
+  for (size_t i = 0; i < count; i++)
+    indices[i] = (uint16_t)((object->next_systematic_repair_symbol + i) %
+                            object->data_symbols);
+  return transport_repair_build(fec_cache, object, false, indices, count,
+                                batch);
+}
+
+bool transport_repair_commit_systematic_fallback(
+    sent_object_cache_t *object, const transport_repair_batch_t *batch,
+    size_t admitted) {
+  if (!object || !batch || admitted == 0 || admitted > batch->count ||
+      object->data_symbols == 0 ||
+      object->next_systematic_repair_symbol >= object->data_symbols)
+    return false;
+  for (size_t i = 0; i < admitted; i++)
+    if (batch->indices[i] !=
+        (object->next_systematic_repair_symbol + i) % object->data_symbols)
+      return false;
+  object->next_systematic_repair_symbol =
+      (uint16_t)((object->next_systematic_repair_symbol + admitted) %
+                 object->data_symbols);
   return true;
 }

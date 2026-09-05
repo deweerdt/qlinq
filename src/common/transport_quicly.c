@@ -356,6 +356,13 @@ transport_t *transport_create(const transport_config_t *config) {
   t->owner_thread = pthread_self();
   atomic_init(&t->cross_thread_violations, 0);
   t->limits = limits;
+  if (config->repair_mode != TRANSPORT_REPAIR_MODE_AUTO &&
+      config->repair_mode != TRANSPORT_REPAIR_MODE_INDEXED &&
+      config->repair_mode != TRANSPORT_REPAIR_MODE_RATELESS) {
+    free(t);
+    return NULL;
+  }
+  t->repair_mode = config->repair_mode;
   t->next_conn_id = 1;
   t->ifmon_pipe[0] = -1;
   t->ifmon_pipe[1] = -1;
@@ -761,22 +768,33 @@ void transport_tick(transport_t *t) {
         moq_track_id_t resolved_track;
         if (transport_subscriptions_find_by_alias(&conn->subscriptions,
                                                   asm_slot->track_id,
-                                                  &resolved_track) == 0) {
-          if (!(resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS))
-            continue; /* Fixed RS-FEC does not send NACKs */
-        }
+                                                  &resolved_track) != 0 ||
+            !(resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS))
+          continue; /* Fixed RS-FEC does not send NACKs */
+        transport_repair_mode_t repair_mode =
+            transport_get_effective_repair_mode(t, conn, &resolved_track);
         uint16_t missing_count = 0;
-        for (uint16_t s = 0; s < asm_slot->total_symbols; s++) {
-          if (!asm_slot->received_mask[s] &&
-              missing_count < TRANSPORT_REPAIR_MAX_SYMBOLS) {
-            asm_slot->missing_indices[missing_count++] = s;
+        const uint16_t *missing = NULL;
+        if (repair_mode == TRANSPORT_REPAIR_MODE_RATELESS) {
+          missing_count = asm_slot->received_count < asm_slot->data_symbols
+                              ? (uint16_t)(asm_slot->data_symbols -
+                                           asm_slot->received_count)
+                              : 1U;
+          if (missing_count > TRANSPORT_REPAIR_MAX_SYMBOLS)
+            missing_count = TRANSPORT_REPAIR_MAX_SYMBOLS;
+        } else {
+          for (uint16_t s = 0; s < asm_slot->total_symbols; s++) {
+            if (!asm_slot->received_mask[s] &&
+                missing_count < TRANSPORT_REPAIR_MAX_SYMBOLS) {
+              asm_slot->missing_indices[missing_count++] = s;
+            }
           }
+          missing = asm_slot->missing_indices;
         }
         if (missing_count > 0) {
           if (transport_protocol_send_nack(
                   conn, asm_slot->track_id, asm_slot->group_id,
-                  asm_slot->object_id, asm_slot->missing_indices,
-                  missing_count, false)) {
+                  asm_slot->object_id, missing, missing_count, false)) {
             asm_slot->nack_sent = true;
             asm_slot->last_nack_time_ms = now_nack_ms;
           }
@@ -1439,6 +1457,19 @@ bool transport_get_conn_stats(transport_t *t, transport_conn_t *conn,
 uint32_t transport_get_conn_id(transport_t *t, transport_conn_t *conn) {
   return transport_owner_ok(t) && transport_has_connection(t, conn) ? conn->id
                                                                     : 0;
+}
+
+transport_repair_mode_t
+transport_get_effective_repair_mode(transport_t *t, transport_conn_t *conn,
+                                    const moq_track_id_t *track_id) {
+  if (!transport_owner_ok(t) || !transport_has_connection(t, conn) ||
+      !transport_track_id_valid(track_id))
+    return TRANSPORT_REPAIR_MODE_INDEXED;
+  return t->repair_mode != TRANSPORT_REPAIR_MODE_INDEXED &&
+                 (track_id->flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0 &&
+                 (conn->peer_capabilities & QLINQ_WIRE_CAP_RATELESS_REPAIR) != 0
+             ? TRANSPORT_REPAIR_MODE_RATELESS
+             : TRANSPORT_REPAIR_MODE_INDEXED;
 }
 
 int transport_enable_qlog(const char *socket_path) {

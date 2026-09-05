@@ -99,7 +99,7 @@ int main(void) {
     CHECK(qlinq_wire_nack_index(&nack, i, &index) && index == missing[i],
           "nack index roundtrip");
   }
-  payload[1] = 2;
+  payload[1] = 4;
   CHECK(qlinq_wire_decode_nack(payload, payload_len, &nack) ==
             QLINQ_WIRE_INVALID,
         "nack reserved byte");
@@ -117,6 +117,36 @@ int main(void) {
             nack.flags == QLINQ_WIRE_NACK_WHOLE_OBJECT &&
             nack.missing_count == 0,
         "whole-object nack roundtrip");
+  CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 13,
+                               QLINQ_WIRE_NACK_RATELESS, large_group_id,
+                               large_object_id, NULL, 7,
+                               &payload_len) == QLINQ_WIRE_OK &&
+            payload_len == 20 &&
+            qlinq_wire_decode_nack(payload, payload_len, &nack) ==
+                QLINQ_WIRE_OK &&
+            nack.flags == QLINQ_WIRE_NACK_RATELESS && nack.missing_count == 7 &&
+            nack.encoded_indices == NULL,
+        "rateless nack uses constant-size deficit encoding");
+  uint16_t unused_index = 0;
+  CHECK(!qlinq_wire_nack_index(&nack, 0, &unused_index) &&
+            qlinq_wire_encode_nack(payload, sizeof(payload), 13,
+                                   QLINQ_WIRE_NACK_RATELESS, large_group_id,
+                                   large_object_id, missing, 1,
+                                   &payload_len) == QLINQ_WIRE_INVALID &&
+            qlinq_wire_encode_nack(payload, sizeof(payload), 13,
+                                   QLINQ_WIRE_NACK_RATELESS, large_group_id,
+                                   large_object_id, NULL, 0,
+                                   &payload_len) == QLINQ_WIRE_INVALID,
+        "rateless nack rejects indices and empty partial deficit");
+  CHECK(qlinq_wire_encode_nack(payload, sizeof(payload), 13,
+                               QLINQ_WIRE_NACK_RATELESS |
+                                   QLINQ_WIRE_NACK_WHOLE_OBJECT,
+                               large_group_id, large_object_id, NULL, 0,
+                               &payload_len) == QLINQ_WIRE_OK &&
+            payload_len == 20 &&
+            qlinq_wire_decode_nack(payload, payload_len, &nack) ==
+                QLINQ_WIRE_OK,
+        "rateless whole-object request is constant-sized");
 
   qlinq_wire_track_object_t track_object = {.alias = 17,
                                             .is_keyframe = true,
@@ -226,7 +256,8 @@ int main(void) {
                               .max_paths = 4,
                               .capabilities = QLINQ_WIRE_CAP_RELIABLE |
                                               QLINQ_WIRE_CAP_DATAGRAM |
-                                              QLINQ_WIRE_CAP_FEC_RATELESS,
+                                              QLINQ_WIRE_CAP_FEC_RATELESS |
+                                              QLINQ_WIRE_CAP_RATELESS_REPAIR,
                               .max_reliable_object_size = 1024U * 1024U - 16U,
                               .max_fec_object_size = 1024U * 1024U,
                               .max_subscriptions = 32,

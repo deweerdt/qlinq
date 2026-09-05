@@ -184,14 +184,18 @@ qlinq_wire_encode_nack(uint8_t *dst, size_t capacity, uint8_t alias,
                        uint8_t flags, uint64_t group_id, uint64_t object_id,
                        const uint16_t *missing, uint16_t missing_count,
                        size_t *written) {
-  if (!dst || !written || (flags & ~QLINQ_WIRE_NACK_WHOLE_OBJECT) != 0 ||
-      ((flags & QLINQ_WIRE_NACK_WHOLE_OBJECT) != 0
-           ? missing_count != 0
-           : (missing_count == 0 || !missing)))
+  bool whole_object = (flags & QLINQ_WIRE_NACK_WHOLE_OBJECT) != 0;
+  bool rateless = (flags & QLINQ_WIRE_NACK_RATELESS) != 0;
+  if (!dst || !written ||
+      (flags & ~(QLINQ_WIRE_NACK_WHOLE_OBJECT | QLINQ_WIRE_NACK_RATELESS)) !=
+          0 ||
+      (rateless ? (!whole_object && missing_count == 0) || missing != NULL
+                : (whole_object ? missing_count != 0
+                                : (missing_count == 0 || !missing))))
     return QLINQ_WIRE_INVALID;
   if (missing_count > QLINQ_WIRE_MAX_NACK_SYMBOLS)
     return QLINQ_WIRE_TOO_LARGE;
-  size_t needed = 20U + (size_t)missing_count * 2U;
+  size_t needed = 20U + (rateless ? 0U : (size_t)missing_count * 2U);
   if (capacity < needed)
     return QLINQ_WIRE_TOO_LARGE;
   dst[0] = alias;
@@ -199,8 +203,9 @@ qlinq_wire_encode_nack(uint8_t *dst, size_t capacity, uint8_t alias,
   write_u64(dst + 2, group_id);
   write_u64(dst + 10, object_id);
   write_u16(dst + 18, missing_count);
-  for (size_t i = 0; i < missing_count; i++)
-    write_u16(dst + 20 + i * 2, missing[i]);
+  if (!rateless)
+    for (size_t i = 0; i < missing_count; i++)
+      write_u16(dst + 20 + i * 2, missing[i]);
   *written = needed;
   return QLINQ_WIRE_OK;
 }
@@ -208,21 +213,25 @@ qlinq_wire_encode_nack(uint8_t *dst, size_t capacity, uint8_t alias,
 qlinq_wire_result_t qlinq_wire_decode_nack(const uint8_t *src, size_t len,
                                            qlinq_wire_nack_t *nack) {
   if (!src || !nack || len < 20 ||
-      (src[1] & ~QLINQ_WIRE_NACK_WHOLE_OBJECT) != 0)
+      (src[1] & ~(QLINQ_WIRE_NACK_WHOLE_OBJECT | QLINQ_WIRE_NACK_RATELESS)) !=
+          0)
     return QLINQ_WIRE_INVALID;
   uint16_t count = read_u16(src + 18);
   if (count > QLINQ_WIRE_MAX_NACK_SYMBOLS)
     return QLINQ_WIRE_TOO_LARGE;
-  if ((src[1] & QLINQ_WIRE_NACK_WHOLE_OBJECT) != 0 ? count != 0 : count == 0)
+  bool whole_object = (src[1] & QLINQ_WIRE_NACK_WHOLE_OBJECT) != 0;
+  bool rateless = (src[1] & QLINQ_WIRE_NACK_RATELESS) != 0;
+  if (rateless ? (!whole_object && count == 0)
+               : (whole_object ? count != 0 : count == 0))
     return QLINQ_WIRE_INVALID;
-  if (len != 20U + (size_t)count * 2U)
+  if (len != 20U + (rateless ? 0U : (size_t)count * 2U))
     return QLINQ_WIRE_INVALID;
   nack->alias = src[0];
   nack->flags = src[1];
   nack->group_id = read_u64(src + 2);
   nack->object_id = read_u64(src + 10);
   nack->missing_count = count;
-  nack->encoded_indices = src + 20;
+  nack->encoded_indices = rateless ? NULL : src + 20;
   return QLINQ_WIRE_OK;
 }
 

@@ -23,7 +23,8 @@ bool transport_track_type_valid(uint8_t type) {
 static uint32_t local_capabilities(void) {
   return QLINQ_WIRE_CAP_RELIABLE | QLINQ_WIRE_CAP_DATAGRAM |
          QLINQ_WIRE_CAP_FEC_REED_SOLOMON | QLINQ_WIRE_CAP_FEC_RATELESS |
-         QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION;
+         QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION |
+         QLINQ_WIRE_CAP_RATELESS_REPAIR;
 }
 
 bool transport_protocol_send_hello(transport_conn_t *conn) {
@@ -108,33 +109,15 @@ static void close_wire_error(transport_conn_t *conn,
   quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL, reason);
 }
 
-static bool repair_request_allowed(transport_conn_t *conn,
-                                   const qlinq_wire_nack_t *nack) {
+static bool repair_request_allowed(transport_conn_t *conn) {
   int64_t now = transport_get_time_ms();
-  if (conn->repair_window_start_ms == 0 ||
-      now - conn->repair_window_start_ms >= 1000) {
-    conn->repair_window_start_ms = now;
-    conn->repair_requests_in_window = 0;
-  }
   conn->transport->stats.repair_requests_received++;
-  if (conn->repair_requests_in_window >=
-      conn->transport->limits.max_repair_requests_per_second) {
+  if (!transport_repair_limiter_take(
+          &conn->repair_request_limiter,
+          conn->transport->limits.max_repair_requests_per_second, now)) {
     conn->transport->stats.repair_requests_throttled++;
     return false;
   }
-  if (conn->last_repair_ms != 0 &&
-      now - conn->last_repair_ms < QLINQ_FEC_REPAIR_DEDUP_MS &&
-      conn->last_repair_alias == nack->alias &&
-      conn->last_repair_flags == nack->flags &&
-      conn->last_repair_group_id == nack->group_id &&
-      conn->last_repair_object_id == nack->object_id)
-    return false;
-  conn->repair_requests_in_window++;
-  conn->last_repair_ms = now;
-  conn->last_repair_alias = nack->alias;
-  conn->last_repair_flags = nack->flags;
-  conn->last_repair_group_id = nack->group_id;
-  conn->last_repair_object_id = nack->object_id;
   return true;
 }
 
@@ -404,10 +387,26 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
         break;
       }
 
-      if (repair_request_allowed(conn, &nack)) {
+      if (repair_request_allowed(conn)) {
         moq_track_id_t resolved_track;
         if (transport_subscriptions_find_by_alias(
                 &conn->subscriptions, nack.alias, &resolved_track) == 0) {
+          bool wire_rateless = (nack.flags & QLINQ_WIRE_NACK_RATELESS) != 0;
+          if (wire_rateless &&
+              ((resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) == 0 ||
+               (conn->peer_capabilities & QLINQ_WIRE_CAP_RATELESS_REPAIR) ==
+                   0)) {
+            quicly_close(conn->quic, TRANSPORT_APP_ERROR_PROTOCOL,
+                         "protocol error: repair mode mismatch");
+            break;
+          }
+          transport_repair_mode_t repair_mode =
+              wire_rateless ? TRANSPORT_REPAIR_MODE_RATELESS
+                            : TRANSPORT_REPAIR_MODE_INDEXED;
+          if (wire_rateless)
+            t->stats.repair_rateless_requests_received++;
+          else
+            t->stats.repair_indexed_requests_received++;
           sent_object_cache_t *cached = transport_sent_cache_find(
               &t->sent_cache, &resolved_track, nack.group_id, nack.object_id);
           if (cached) {
@@ -416,20 +415,54 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
             if (missing_count > TRANSPORT_REPAIR_MAX_SYMBOLS)
               missing_count = TRANSPORT_REPAIR_MAX_SYMBOLS;
             bool indices_valid = true;
-            for (size_t i = 0; i < missing_count; i++) {
-              if (!qlinq_wire_nack_index(&nack, i, &missing[i]) ||
-                  missing[i] >= QLINQ_FEC_MAX_TOTAL_SYMBOLS) {
-                indices_valid = false;
-                break;
+            if (repair_mode == TRANSPORT_REPAIR_MODE_INDEXED) {
+              for (size_t i = 0; i < missing_count; i++) {
+                if (!qlinq_wire_nack_index(&nack, i, &missing[i]) ||
+                    missing[i] >= QLINQ_FEC_MAX_TOTAL_SYMBOLS) {
+                  indices_valid = false;
+                  break;
+                }
               }
+              if (indices_valid)
+                missing_count =
+                    transport_repair_normalize_indices(missing, missing_count);
             }
 
             bool whole_object =
                 (nack.flags & QLINQ_WIRE_NACK_WHOLE_OBJECT) != 0;
+            if (repair_mode == TRANSPORT_REPAIR_MODE_RATELESS && whole_object) {
+              missing_count = cached->data_symbols;
+              if (missing_count > TRANSPORT_REPAIR_MAX_SYMBOLS)
+                missing_count = TRANSPORT_REPAIR_MAX_SYMBOLS;
+            }
+            int64_t now = transport_get_time_ms();
+            if (!transport_repair_limiter_take(
+                    &t->aggregate_repair_limiter,
+                    t->limits.max_aggregate_repair_requests_per_second, now)) {
+              t->stats.repair_requests_aggregate_throttled++;
+              quicly_streambuf_ingress_shift(stream, frame.consumed);
+              continue;
+            }
             transport_repair_batch_t repair;
-            if (indices_valid &&
-                transport_repair_build(&t->fec_cache, cached, whole_object,
-                                       missing, missing_count, &repair)) {
+            bool systematic_fallback = false;
+            bool built =
+                indices_valid &&
+                (repair_mode == TRANSPORT_REPAIR_MODE_RATELESS
+                     ? transport_repair_build_rateless(
+                           &t->fec_cache, cached, missing_count, &repair)
+                     : transport_repair_build(&t->fec_cache, cached,
+                                              whole_object, missing,
+                                              missing_count, &repair));
+            if (!built && indices_valid &&
+                repair_mode == TRANSPORT_REPAIR_MODE_RATELESS &&
+                cached->next_repair_symbol >= QLINQ_FEC_MAX_TOTAL_SYMBOLS) {
+              t->stats.repair_rateless_exhausted++;
+              built = transport_repair_build_systematic_fallback(
+                  &t->fec_cache, cached, missing_count, &repair);
+              systematic_fallback = built;
+            }
+            if (built) {
+              size_t repairs_queued = 0;
               for (size_t i = 0; i < repair.count; i++) {
                 uint8_t packet[QLINQ_WIRE_FEC_HEADER_SIZE +
                                QLINQ_FEC_MAX_SYMBOL_SIZE];
@@ -457,7 +490,22 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                 ptls_iovec_t datagram = ptls_iovec_init(packet, packet_len);
                 if (!transport_queue_datagram(conn, 0, datagram))
                   break;
+                repairs_queued++;
               }
+              if (repairs_queued != 0 &&
+                  repair_mode == TRANSPORT_REPAIR_MODE_RATELESS) {
+                bool committed =
+                    systematic_fallback
+                        ? transport_repair_commit_systematic_fallback(
+                              cached, &repair, repairs_queued)
+                        : transport_repair_commit_rateless(cached, &repair,
+                                                           repairs_queued);
+                if (!committed)
+                  t->stats.protocol_errors++;
+              }
+              t->stats.repair_symbols_sent += repairs_queued;
+              if (repair_mode == TRANSPORT_REPAIR_MODE_RATELESS)
+                t->stats.repair_rateless_symbols_sent += repairs_queued;
               transport_repair_batch_destroy(&repair);
             }
           }
@@ -646,7 +694,24 @@ bool transport_protocol_send_nack(transport_conn_t *conn, uint8_t alias,
 
   if (count > QLINQ_WIRE_MAX_NACK_SYMBOLS)
     return false;
-  size_t payload_len = 20U + (size_t)count * 2U;
+  moq_track_id_t track_id;
+  if (transport_subscriptions_find_by_alias(&conn->subscriptions, alias,
+                                            &track_id) != 0)
+    return false;
+  bool rateless =
+      transport_get_effective_repair_mode(conn->transport, conn, &track_id) ==
+      TRANSPORT_REPAIR_MODE_RATELESS;
+  if (rateless ? (!whole_object && (count == 0 || missing != NULL))
+               : (!whole_object && (count == 0 || missing == NULL)))
+    return false;
+  int64_t now = transport_get_time_ms();
+  if (!transport_repair_limiter_take(
+          &conn->nack_request_limiter,
+          conn->transport->limits.max_repair_requests_per_second, now)) {
+    conn->transport->stats.repair_requests_deferred++;
+    return false;
+  }
+  size_t payload_len = 20U + (rateless ? 0U : (size_t)count * 2U);
   uint8_t static_buf[1024];
   uint8_t *buf = static_buf;
   if (payload_len > sizeof(static_buf)) {
@@ -658,12 +723,22 @@ bool transport_protocol_send_nack(transport_conn_t *conn, uint8_t alias,
   size_t written = 0;
   bool sent = false;
   uint8_t flags = whole_object ? QLINQ_WIRE_NACK_WHOLE_OBJECT : 0;
+  if (rateless)
+    flags |= QLINQ_WIRE_NACK_RATELESS;
   if (qlinq_wire_encode_nack(buf, payload_len, alias, flags, group_id,
                              object_id, missing, count,
                              &written) == QLINQ_WIRE_OK &&
       transport_stream_write_frame(conn->stream, QLINQ_WIRE_NACK, buf,
-                                   written))
+                                   written)) {
+    conn->transport->stats.repair_requests_sent++;
+    if (rateless)
+      conn->transport->stats.repair_rateless_requests_sent++;
+    else
+      conn->transport->stats.repair_indexed_requests_sent++;
+    if (whole_object)
+      conn->transport->stats.repair_whole_object_requests_sent++;
     sent = true;
+  }
 
   if (buf != static_buf) {
     free(buf);

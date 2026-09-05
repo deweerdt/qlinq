@@ -1,11 +1,13 @@
 #include "transport_config.h"
 #include "transport_egress.h"
 #include "transport_fec_state.h"
+#include "transport_internal.h"
 #include "transport_memory.h"
 #include "transport_paths.h"
 #include "transport_repair.h"
 #include "transport_scheduler.h"
 #include "transport_subscriptions.h"
+#include "transport_wire.h"
 
 #include <stdio.h>
 #include <string.h>
@@ -28,8 +30,15 @@ int main(void) {
   CHECK(resolved_limits.max_connections == TRANSPORT_DEFAULT_MAX_CONNECTIONS &&
             resolved_limits.max_subscriptions_per_connection ==
                 TRANSPORT_DEFAULT_MAX_SUBSCRIPTIONS &&
+            resolved_limits.max_aggregate_repair_requests_per_second ==
+                TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND &&
             resolved_limits.max_udp_payload_size == 1280,
         "default limits");
+  configured.max_aggregate_repair_requests_per_second = UINT16_MAX + 1U;
+  CHECK(!transport_limits_resolve(&configured, &resolved_limits, limit_error,
+                                  sizeof(limit_error)),
+        "aggregate repair hard limit rejection");
+  configured.max_aggregate_repair_requests_per_second = 0;
   configured.max_egress_packets_per_socket = 63;
   CHECK(!transport_limits_resolve(&configured, &resolved_limits, limit_error,
                                   sizeof(limit_error)),
@@ -175,12 +184,101 @@ int main(void) {
             repair.total_symbols == cached->total_symbols,
         "repair preserves original FEC dimensions");
   transport_repair_batch_destroy(&repair);
+
+  moq_track_id_t rateless_track = {.type = MOQ_TRACK_DATA,
+                                   .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
+                                   .name = "rateless-data"};
+  moq_object_t rateless_object = object;
+  rateless_object.track_id = rateless_track;
+  transport_sent_cache_t rateless_cache = {0};
+  CHECK(transport_sent_cache_store(&rateless_cache, &rateless_object, 2, 2, 2),
+        "rateless sent-object cache store");
+  sent_object_cache_t *rateless_cached = transport_sent_cache_find(
+      &rateless_cache, &rateless_track, object.group_id, object.object_id);
+  CHECK(rateless_cached && rateless_cached->next_repair_symbol == 2 &&
+            transport_repair_build_rateless(&repair_fec_cache, rateless_cached,
+                                            2, &repair) &&
+            repair.count == 2 && repair.indices[0] == 2 &&
+            repair.indices[1] == 3 && repair.total_symbols == 4 &&
+            rateless_cached->next_repair_symbol == 2,
+        "rateless repair reserves fresh ESIs transactionally");
+  uint8_t decode_data_0[2] = {1, 2};
+  uint8_t decode_data_1[2] = {0};
+  uint8_t decode_repair_0[2];
+  uint8_t decode_repair_1[2];
+  memcpy(decode_repair_0, repair.symbols, 2);
+  memcpy(decode_repair_1, repair.symbols + 2, 2);
+  uint8_t *decode_blocks[] = {decode_data_0, decode_data_1, decode_repair_0,
+                              decode_repair_1};
+  bool decode_missing[] = {false, true, false, false};
+  fec_t *rateless_decoder =
+      transport_fec_cache_get(&repair_fec_cache, FEC_RAPTORQ, 2, 2, 2);
+  CHECK(rateless_decoder &&
+            fec_decode(rateless_decoder, decode_blocks, decode_missing) &&
+            decode_data_1[0] == 3 && decode_data_1[1] == 4,
+        "fresh rateless repair recovers a missing source symbol");
+  CHECK(transport_repair_commit_rateless(rateless_cached, &repair, 2) &&
+            rateless_cached->next_repair_symbol == 4,
+        "rateless repair consumes only admitted ESIs");
+  transport_repair_batch_destroy(&repair);
+  CHECK(transport_repair_build_rateless(&repair_fec_cache, rateless_cached, 3,
+                                        &repair) &&
+            repair.indices[0] == 4 && repair.indices[2] == 6 &&
+            transport_repair_commit_rateless(rateless_cached, &repair, 1) &&
+            rateless_cached->next_repair_symbol == 5,
+        "partial admission leaves unused rateless ESIs available");
+  transport_repair_batch_destroy(&repair);
+  rateless_cached->next_repair_symbol = QLINQ_FEC_MAX_TOTAL_SYMBOLS;
+  CHECK(transport_repair_build_systematic_fallback(
+            &repair_fec_cache, rateless_cached, 4, &repair) &&
+            repair.count == 2 && repair.indices[0] == 0 &&
+            repair.indices[1] == 1 &&
+            transport_repair_commit_systematic_fallback(rateless_cached,
+                                                        &repair, 1) &&
+            rateless_cached->next_systematic_repair_symbol == 1,
+        "ESI exhaustion falls back to systematic source symbols");
+  transport_repair_batch_destroy(&repair);
+
+  transport_t negotiation_transport = {0};
+  transport_conn_t negotiation_conn = {.transport = &negotiation_transport};
+  negotiation_transport.owner_thread = pthread_self();
+  negotiation_transport.client_conn = &negotiation_conn;
+  negotiation_transport.repair_mode = TRANSPORT_REPAIR_MODE_AUTO;
+  negotiation_conn.peer_capabilities = QLINQ_WIRE_CAP_FEC_RATELESS;
+  CHECK(transport_get_effective_repair_mode(
+            &negotiation_transport, &negotiation_conn, &rateless_track) ==
+            TRANSPORT_REPAIR_MODE_INDEXED,
+        "legacy rateless peer falls back to indexed repair");
+  negotiation_conn.peer_capabilities |= QLINQ_WIRE_CAP_RATELESS_REPAIR;
+  CHECK(transport_get_effective_repair_mode(
+            &negotiation_transport, &negotiation_conn, &rateless_track) ==
+            TRANSPORT_REPAIR_MODE_RATELESS,
+        "rateless capability enables degree-of-freedom repair");
+  negotiation_transport.repair_mode = TRANSPORT_REPAIR_MODE_INDEXED;
+  CHECK(transport_get_effective_repair_mode(
+            &negotiation_transport, &negotiation_conn, &rateless_track) ==
+            TRANSPORT_REPAIR_MODE_INDEXED,
+        "indexed preference overrides rateless capability");
+
+  transport_repair_limiter_t limiter = {0};
+  CHECK(transport_repair_limiter_take(&limiter, 4, 100) &&
+            transport_repair_limiter_take(&limiter, 4, 100) &&
+            transport_repair_limiter_take(&limiter, 4, 100) &&
+            transport_repair_limiter_take(&limiter, 4, 100) &&
+            !transport_repair_limiter_take(&limiter, 4, 100) &&
+            transport_repair_limiter_take(&limiter, 4, 350),
+        "repair limiter burst and smooth refill");
+  uint16_t unordered_request[] = {7, 1, 7};
+  CHECK(transport_repair_normalize_indices(unordered_request, 3) == 2 &&
+            unordered_request[0] == 1 && unordered_request[1] == 7,
+        "repair request normalization sorts and deduplicates");
   CHECK(transport_repair_build(&repair_fec_cache, cached, true, NULL, 0,
                                &repair) &&
             repair.count == cached->data_symbols,
         "whole-object repair is bounded data retransmission");
   transport_repair_batch_destroy(&repair);
   transport_fec_cache_destroy(&repair_fec_cache);
+  transport_sent_cache_destroy(&rateless_cache);
   transport_sent_cache_destroy(&sent_cache);
 
   transport_fec_cache_t fec_cache = {0};

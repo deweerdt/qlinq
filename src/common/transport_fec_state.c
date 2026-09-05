@@ -46,6 +46,8 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
       return false;
     if (total_symbols > existing->total_symbols)
       existing->total_symbols = total_symbols;
+    if (existing->next_repair_symbol < existing->total_symbols)
+      existing->next_repair_symbol = existing->total_symbols;
     existing->data_symbols = data_symbols;
     existing->symbol_size = symbol_size;
     existing->priority = object->priority;
@@ -69,6 +71,8 @@ bool transport_sent_cache_store(transport_sent_cache_t *cache,
   entry->total_symbols = total_symbols;
   entry->data_symbols = data_symbols;
   entry->symbol_size = symbol_size;
+  entry->next_repair_symbol = total_symbols;
+  entry->next_systematic_repair_symbol = 0;
   entry->data = copy;
   cache->next_entry = (cache->next_entry + 1U) % TRANSPORT_SENT_CACHE_SIZE;
   return true;

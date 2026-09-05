@@ -57,17 +57,32 @@ The HELLO payload is 20 bytes:
 | 18 | 2 | Maximum UDP payload bytes |
 
 Defined capabilities are reliable objects (`0x01`), datagrams (`0x02`),
-Reed-Solomon FEC (`0x04`), rateless FEC (`0x08`), multipath (`0x10`), and
-application authentication (`0x20`). Unknown capability bits, duplicate HELLO
-frames, a peer with the wrong role, or an application frame before HELLO are
-protocol errors. Each connection uses the lower local/peer object,
-subscription, and UDP-payload limits.
+Reed-Solomon FEC (`0x04`), rateless FEC (`0x08`), multipath (`0x10`),
+application authentication (`0x20`), and degree-of-freedom rateless repair
+(`0x100`). Unknown capability bits, duplicate HELLO frames, a peer with the
+wrong role, or an application frame before HELLO are protocol errors. Each
+connection uses the lower local/peer object, subscription, and UDP-payload
+limits.
 
 A track descriptor contains alias, track type, flags, one-byte name length,
 and up to 63 name bytes. A NACK descriptor contains alias, a flags byte,
-64-bit group ID, 64-bit object ID, a 16-bit missing-symbol count, and that many
-16-bit symbol indices. The count is limited to 1,024. Flag `0x01` requests a
-whole object and requires a zero symbol count; all other flag bits are reserved.
+64-bit group ID, 64-bit object ID, and a 16-bit count. The count is limited to
+1,024. Flag `0x01` requests a whole object. Flag `0x02` selects rateless repair
+and is valid only when the peer advertised `0x100` and the track uses rateless
+FEC.
+
+In indexed mode, the count is followed by that many 16-bit missing ESIs. A
+whole-object request has a zero count. In rateless mode, the 20-byte descriptor
+has no ESI list: the count is the number of additional degrees of freedom. A
+rateless whole-object request has a zero count because the source derives the
+initial deficit from the cached object's source-symbol count. Peers without
+the rateless-repair capability continue using indexed NACKs.
+
+The source emits fresh monotonic RaptorQ ESIs and commits only those admitted
+to its bounded datagram queue. Once the 1,024-symbol ESI namespace is
+exhausted, it cycles retained systematic symbols so recovery remains possible
+without unbounded sender state. Per-peer and source-wide token buckets bound
+repair request load.
 
 Reliable-object metadata contains an alias, keyframe flag, priority, one
 reserved zero byte, 64-bit group ID, and 64-bit object ID. Each unidirectional

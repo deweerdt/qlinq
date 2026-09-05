@@ -34,6 +34,14 @@ typedef enum {
 #define MOQ_TRACK_FLAG_FEC_ENABLED (1 << 1)
 #define MOQ_TRACK_FLAG_FEC_RATELESS (1 << 2)
 
+typedef enum {
+  /* AUTO prefers degree-of-freedom repair for a rateless track when the peer
+   * advertises support, otherwise it uses indexed repair. */
+  TRANSPORT_REPAIR_MODE_AUTO = 0,
+  TRANSPORT_REPAIR_MODE_INDEXED = 1,
+  TRANSPORT_REPAIR_MODE_RATELESS = 2
+} transport_repair_mode_t;
+
 typedef struct {
   moq_track_type_t type;
   uint8_t flags;
@@ -102,6 +110,7 @@ typedef void (*transport_callback_t)(void *user_data,
 #define TRANSPORT_DEFAULT_MAX_SUBSCRIPTIONS 32U
 #define TRANSPORT_DEFAULT_MAX_ASSEMBLERS 8U
 #define TRANSPORT_DEFAULT_MAX_REPAIR_REQUESTS_PER_SECOND 16U
+#define TRANSPORT_DEFAULT_MAX_AGGREGATE_REPAIR_REQUESTS_PER_SECOND 256U
 #define TRANSPORT_DEFAULT_MAX_EGRESS_PACKETS 1024U
 #define TRANSPORT_DEFAULT_MAX_EGRESS_BYTES (2U * 1024U * 1024U)
 #define TRANSPORT_DEFAULT_ASSEMBLER_MEMORY_BUDGET (64U * 1024U * 1024U)
@@ -117,6 +126,7 @@ typedef struct {
   size_t max_subscriptions_per_connection;
   size_t max_assemblers_per_connection;
   size_t max_repair_requests_per_second;
+  size_t max_aggregate_repair_requests_per_second;
   size_t max_egress_packets_per_socket;
   size_t max_egress_bytes_per_socket;
   size_t max_assembler_memory_bytes;
@@ -154,6 +164,7 @@ typedef struct {
   void *user_data;
   uint8_t simulated_loss_rate; /* 0 to 100 representing percentage of packets to
                                   drop */
+  transport_repair_mode_t repair_mode;
   transport_limits_t limits;   /* zero fields select documented defaults */
 } transport_config_t;
 
@@ -232,7 +243,18 @@ typedef struct {
   uint64_t fec_objects_lost;
   uint64_t fec_duplicate_objects_suppressed;
   uint64_t repair_requests_received;
+  uint64_t repair_indexed_requests_received;
+  uint64_t repair_rateless_requests_received;
   uint64_t repair_requests_throttled;
+  uint64_t repair_requests_aggregate_throttled;
+  uint64_t repair_requests_sent;
+  uint64_t repair_indexed_requests_sent;
+  uint64_t repair_rateless_requests_sent;
+  uint64_t repair_requests_deferred;
+  uint64_t repair_whole_object_requests_sent;
+  uint64_t repair_symbols_sent;
+  uint64_t repair_rateless_symbols_sent;
+  uint64_t repair_rateless_exhausted;
   uint64_t events_emitted;
   uint64_t api_thread_violations;
   uint64_t recursive_tick_rejections;
@@ -271,6 +293,10 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats);
 bool transport_get_conn_stats(transport_t *t, transport_conn_t *conn,
                               transport_conn_stats_t *stats);
 uint32_t transport_get_conn_id(transport_t *t, transport_conn_t *conn);
+
+transport_repair_mode_t
+transport_get_effective_repair_mode(transport_t *t, transport_conn_t *conn,
+                                    const moq_track_id_t *track_id);
 
 bool transport_get_path_stats(transport_t *t, size_t path_idx,
                               transport_path_stats_t *stats);
