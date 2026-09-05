@@ -19,6 +19,7 @@ typedef struct {
   bool data_a_received;
   bool data_b_received;
   bool checkpoint_subscribed;
+  bool checkpoint_unsubscribed;
   size_t checkpoint_objects_received;
   uint64_t catalog_group_id;
   uint64_t catalog_object_id;
@@ -73,6 +74,11 @@ static void on_server_event(void *user_data, const transport_event_t *event) {
     break;
   case TRANSPORT_EVENT_AUTH:
     transport_respond_auth(state->transport, event->conn, true);
+    break;
+  case TRANSPORT_EVENT_UNSUBSCRIBE:
+    if (event->track_id.type == MOQ_TRACK_DATA &&
+        strcmp(event->track_id.name, "checkpoint-data") == 0)
+      state->checkpoint_unsubscribed = true;
     break;
   default:
     break;
@@ -462,8 +468,7 @@ int main(void) {
                            .priority = 1};
     if (!transport_publish(server, &record)) {
       fprintf(stderr,
-              "rolling checkpoint publication failed at record %" PRIu64
-              "\n",
+              "rolling checkpoint publication failed at record %" PRIu64 "\n",
               i);
       transport_destroy(client);
       transport_destroy(server);
@@ -501,8 +506,7 @@ int main(void) {
     fprintf(stderr,
             "rolling checkpoint lifecycle failed (objects=%zu, cp_tx=%" PRIu64
             ", cp_rx=%" PRIu64 ", ack_tx=%" PRIu64 ", ack_rx=%" PRIu64
-            ", released=%" PRIu64 ", end_tx=%" PRIu64 ", end_rx=%" PRIu64
-            ")\n",
+            ", released=%" PRIu64 ", end_tx=%" PRIu64 ", end_rx=%" PRIu64 ")\n",
             client_state.checkpoint_objects_received,
             checkpoint_source_stats.recovery_checkpoints_sent,
             checkpoint_receiver_stats.recovery_checkpoints_received,
@@ -511,6 +515,24 @@ int main(void) {
             checkpoint_source_stats.recovery_cache_releases,
             checkpoint_source_stats.track_ends_sent,
             checkpoint_receiver_stats.track_ends_received);
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+  if (!transport_unsubscribe(client, checkpoint_track)) {
+    fprintf(stderr, "checkpoint unsubscribe failed\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+  retries = 100;
+  while (retries-- > 0 && !server_state.checkpoint_unsubscribed) {
+    transport_tick(server);
+    transport_tick(client);
+    usleep(10 * 1000);
+  }
+  if (!server_state.checkpoint_unsubscribed) {
+    fprintf(stderr, "targeted unsubscribe was not observed\n");
     transport_destroy(client);
     transport_destroy(server);
     return 1;

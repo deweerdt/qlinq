@@ -1,6 +1,7 @@
 # Makefile for qlinq
 
 CC = gcc
+AR ?= ar
 ARCH = $(shell uname -m)
 
 # Default CFLAGS for our code
@@ -53,8 +54,7 @@ NANORQ_OBJS = $(NANORQ_SRCS:.c=.o)
 PATHFLOW_OBJS = $(PATHFLOW_SRCS:.c=.o)
 IFMON_OBJS = $(IFMON_SRCS:.c=.o)
 
-COMMON_OBJS = src/common/data_uds.o \
-              src/common/transport_config.o \
+TRANSPORT_OBJS = src/common/transport_config.o \
               src/common/transport_egress.o \
               src/common/transport_fec_state.o \
               src/common/transport_memory.o \
@@ -79,8 +79,13 @@ COMMON_OBJS = src/common/data_uds.o \
               $(PATHFLOW_OBJS) \
               $(IFMON_OBJS)
 
+COMMON_OBJS = src/common/data_uds.o \
+              $(TRANSPORT_OBJS)
+
 DAEMON_OBJS = src/daemon/main.o \
               $(COMMON_OBJS)
+
+APP_OBJS = src/app/main.o
 
 FEC_OBJS = src/common/fec.o \
            deps/nanors/rs.o \
@@ -103,10 +108,16 @@ t/%.o: t/%.c
 deps/%.o: deps/%.c
 	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
 
-all: qlinqd qlinq-tund
+all: qlinqd qlinq-app qlinq-tund
+
+libqlinq.a: $(TRANSPORT_OBJS)
+	$(AR) rcs $@ $(TRANSPORT_OBJS)
 
 qlinqd: $(DAEMON_OBJS)
 	$(CC) -o $@ $(DAEMON_OBJS) $(LDFLAGS)
+
+qlinq-app: $(APP_OBJS) libqlinq.a
+	$(CC) -o $@ $(APP_OBJS) libqlinq.a $(LDFLAGS)
 
 qlinq-tund: src/host/linux/tund.c
 	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -o $@ src/host/linux/tund.c \
@@ -162,7 +173,7 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
 clean: 
-	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
@@ -170,7 +181,7 @@ clean:
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
 
-check: qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack gencerts
+check: qlinqd qlinq-app qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack gencerts
 	prove -I. -v t/*.t
 
 t/assets/server.crt t/assets/server.key &:

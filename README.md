@@ -20,9 +20,33 @@ git submodule update --init --recursive
 make
 ```
 
-This produces two main binaries:
+This produces three binaries and an embeddable transport library:
+
 - `qlinqd`: The background peer-to-peer network daemon.
+- `qlinq-app`: A direct `transport.h` file/stream sender and receiver that does
+  not use the daemon's Unix data socket.
 - `qlinq-tund`: The lightweight virtual TUN/TAP interface controller.
+- `libqlinq.a`: The in-process transport API used by `qlinq-app`.
+
+For example, send one 512-byte rateless-protected record:
+
+```bash
+./qlinq-app --listen 8888 --bind 127.0.0.1 \
+  --auth-token test --insecure-no-verify --input payload.bin \
+  --message-size 512 --count 1 --wait-subscribers 1 --one-shot
+```
+
+Receive it with:
+
+```bash
+./qlinq-app --peer 127.0.0.1:8888 --auth-token test \
+  --insecure-no-verify --output received.bin --receive-count 1
+```
+
+The app also supports reliable, plain datagram, fixed-FEC, and rateless modes,
+IPv6 bracketed peer endpoints, negotiated repair selection, an explicit QUIC
+idle timeout, and machine-readable counter snapshots. Run `qlinq-app --help`
+for the complete interface.
 
 ## Security
 

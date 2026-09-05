@@ -442,6 +442,9 @@ transport_t *transport_create(const transport_config_t *config) {
       t->limits.max_udp_payload_size;
   t->quic_ctx.transport_params.max_datagram_frame_size =
       t->limits.max_udp_payload_size;
+  if (config->quic_idle_timeout_ms != 0)
+    t->quic_ctx.transport_params.max_idle_timeout =
+        config->quic_idle_timeout_ms;
   t->quic_ctx.transport_params.max_streams_uni = 100;
   t->quic_ctx.transport_params.max_streams_bidi = 100;
 
@@ -722,9 +725,9 @@ void transport_tick(transport_t *t) {
         for (uint32_t bit = 0; bit < 32 && object_nack_budget > 0; bit++) {
           if ((gap->pending_mask & (1U << bit)) == 0)
             continue;
-          if (transport_protocol_send_nack(
-                  conn, (uint8_t)alias, gap->group_id, gap->pending_base + bit,
-                  NULL, 0, true)) {
+          if (transport_protocol_send_nack(conn, (uint8_t)alias, gap->group_id,
+                                           gap->pending_base + bit, NULL, 0,
+                                           true)) {
             gap->detected_at_ms = now_nack_ms;
             object_nack_budget--;
           } else {
@@ -1060,11 +1063,13 @@ void transport_tick(transport_t *t) {
           }
           if (!target && t->conn_count < t->limits.max_connections) {
             quicly_conn_t *new_quic = NULL;
+            quicly_cid_plaintext_t connection_cid = t->next_cid;
             int accept_res =
                 quicly_accept(&new_quic, &t->quic_ctx,
                               (struct sockaddr *)&t->local_addrs[fd_idx], psa,
-                              &decoded, NULL, &t->next_cid, NULL, NULL);
+                              &decoded, NULL, &connection_cid, NULL, NULL);
             if (accept_res == 0 && new_quic) {
+              t->next_cid.master_id++;
               target = calloc(1, sizeof(transport_conn_t));
               if (!target) {
                 quicly_free(new_quic);
@@ -1283,78 +1288,109 @@ void transport_tick(transport_t *t) {
   t->tick_active = false;
 }
 
-bool transport_subscribe(transport_t *t, moq_track_id_t track_id) {
-  if (!transport_owner_ok(t) || !transport_track_id_valid(&track_id))
+static bool subscribe_connection(transport_conn_t *conn,
+                                 const moq_track_id_t *track_id) {
+  if (!conn || !conn->protocol_ready || !conn->authenticated || !conn->stream ||
+      !quicly_sendstate_is_open(&conn->stream->sendstate))
     return false;
-
-  if (t->is_server) {
-    for (size_t i = 0; i < t->conn_count; i++) {
-      transport_conn_t *conn = t->conns[i];
-      if (!conn || !conn->protocol_ready || !conn->authenticated ||
-          !conn->stream || !quicly_sendstate_is_open(&conn->stream->sendstate))
-        continue;
-
-      uint8_t alias;
-      if (transport_subscriptions_find_alias(&conn->subscriptions, &track_id,
-                                             &alias) != 0) {
-        if (transport_subscriptions_count(&conn->subscriptions) >=
-            conn->negotiated_limits.max_subscriptions_per_connection)
-          return false;
-        if (track_id.name[0] == '\0') {
-          alias = (uint8_t)track_id.type;
-        } else {
-          int next_alias =
-              transport_subscriptions_next_alias(&conn->subscriptions, 8);
-          if (next_alias < 0)
-            return false;
-          alias = (uint8_t)next_alias;
-        }
-        if (!transport_subscriptions_add(&conn->subscriptions, track_id.type,
-                                         track_id.flags, track_id.name, alias))
-          return false;
-      }
-
-      if (!transport_stream_write_track_frame(
-              conn->stream, QLINQ_WIRE_SUBSCRIBE, alias, &track_id))
-        return false;
-      transport_publish_checkpoint_member_added(t, conn, &track_id, alias);
-    }
-    return true;
-  }
-
-  if (!t->client_conn || !t->client_conn->protocol_ready ||
-      !t->client_conn->authenticated || !t->client_conn->stream ||
-      !quicly_sendstate_is_open(&t->client_conn->stream->sendstate)) {
-    return false;
-  }
 
   uint8_t alias;
-  if (transport_subscriptions_find_alias(&t->client_conn->subscriptions,
-                                         &track_id, &alias) != 0) {
-    if (transport_subscriptions_count(&t->client_conn->subscriptions) >=
-        t->client_conn->negotiated_limits.max_subscriptions_per_connection)
+  if (transport_subscriptions_find_alias(&conn->subscriptions, track_id,
+                                         &alias) != 0) {
+    if (transport_subscriptions_count(&conn->subscriptions) >=
+        conn->negotiated_limits.max_subscriptions_per_connection)
       return false;
-    if (track_id.name[0] == '\0') {
-      alias = (uint8_t)track_id.type;
+    if (track_id->name[0] == '\0') {
+      alias = (uint8_t)track_id->type;
     } else {
       int next_alias =
-          transport_subscriptions_next_alias(&t->client_conn->subscriptions, 8);
+          transport_subscriptions_next_alias(&conn->subscriptions, 8);
       if (next_alias < 0)
         return false;
       alias = (uint8_t)next_alias;
     }
-    if (!transport_subscriptions_add(&t->client_conn->subscriptions,
-                                     track_id.type, track_id.flags,
-                                     track_id.name, alias))
+    if (!transport_subscriptions_add(&conn->subscriptions, track_id->type,
+                                     track_id->flags, track_id->name, alias))
       return false;
   }
 
-  if (!transport_stream_write_track_frame(
-          t->client_conn->stream, QLINQ_WIRE_SUBSCRIBE, alias, &track_id))
+  if (!transport_stream_write_track_frame(conn->stream, QLINQ_WIRE_SUBSCRIBE,
+                                          alias, track_id))
     return false;
-  transport_publish_checkpoint_member_added(t, t->client_conn, &track_id,
+  transport_publish_checkpoint_member_added(conn->transport, conn, track_id,
                                             alias);
   return true;
+}
+
+bool transport_subscribe_conn(transport_t *t, transport_conn_t *conn,
+                              moq_track_id_t track_id) {
+  if (!transport_owner_ok(t) || !transport_track_id_valid(&track_id) ||
+      !transport_has_connection(t, conn))
+    return false;
+  return subscribe_connection(conn, &track_id);
+}
+
+bool transport_subscribe(transport_t *t, moq_track_id_t track_id) {
+  if (!transport_owner_ok(t) || !transport_track_id_valid(&track_id))
+    return false;
+  if (!t->is_server)
+    return t->client_conn && subscribe_connection(t->client_conn, &track_id);
+
+  bool found = false;
+  bool succeeded = true;
+  for (size_t i = 0; i < t->conn_count; i++) {
+    transport_conn_t *conn = t->conns[i];
+    if (!conn || !conn->protocol_ready || !conn->authenticated)
+      continue;
+    found = true;
+    if (!subscribe_connection(conn, &track_id))
+      succeeded = false;
+  }
+  return !found || succeeded;
+}
+
+static bool unsubscribe_connection(transport_t *t, transport_conn_t *conn,
+                                   const moq_track_id_t *track_id) {
+  if (!conn || !conn->protocol_ready || !conn->authenticated || !conn->stream ||
+      !quicly_sendstate_is_open(&conn->stream->sendstate))
+    return false;
+
+  const track_subscription_t *subscription =
+      transport_subscriptions_find_const(&conn->subscriptions, track_id);
+  if (!subscription)
+    return false;
+  moq_track_id_t subscribed_track = subscription->track_id;
+  uint8_t alias = subscription->alias;
+  if (!transport_stream_write_track_frame(conn->stream, QLINQ_WIRE_UNSUBSCRIBE,
+                                          alias, &subscribed_track))
+    return false;
+
+  transport_publish_checkpoint_member_removed(t, conn, &subscribed_track,
+                                              alias);
+  transport_subscriptions_remove(&conn->subscriptions, subscribed_track.type,
+                                 subscribed_track.name);
+  return true;
+}
+
+bool transport_unsubscribe(transport_t *t, moq_track_id_t track_id) {
+  if (!transport_owner_ok(t) || !transport_track_id_valid(&track_id))
+    return false;
+  if (!t->is_server)
+    return t->client_conn &&
+           unsubscribe_connection(t, t->client_conn, &track_id);
+
+  bool found = false;
+  bool succeeded = true;
+  for (size_t i = 0; i < t->conn_count; i++) {
+    transport_conn_t *conn = t->conns[i];
+    if (!conn ||
+        !transport_subscriptions_contains(&conn->subscriptions, &track_id))
+      continue;
+    found = true;
+    if (!unsubscribe_connection(t, conn, &track_id))
+      succeeded = false;
+  }
+  return found && succeeded;
 }
 
 bool transport_request_keyframe(transport_t *t, moq_track_id_t track_id) {
@@ -1467,8 +1503,7 @@ bool transport_get_stats(transport_t *t, transport_stats_t *stats) {
   size_t active_count =
       t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
   for (size_t i = 0; i < active_count; i++) {
-    const transport_conn_t *conn =
-        t->is_server ? t->conns[i] : t->client_conn;
+    const transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
     if (!conn)
       continue;
     for (size_t alias = 0; alias <= UINT8_MAX; alias++) {

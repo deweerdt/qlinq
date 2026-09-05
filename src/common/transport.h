@@ -141,11 +141,11 @@ typedef struct {
 #define TRANSPORT_MAX_FEC_OBJECT_SIZE (1024U * 1024U)
 #define TRANSPORT_MAX_FEC_RECORD_SIZE UINT16_MAX
 
-#define TRANSPORT_APP_ERROR_PROTOCOL                                          \
+#define TRANSPORT_APP_ERROR_PROTOCOL                                           \
   QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x100U)
-#define TRANSPORT_APP_ERROR_AUTHENTICATION                                    \
+#define TRANSPORT_APP_ERROR_AUTHENTICATION                                     \
   QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x101U)
-#define TRANSPORT_APP_ERROR_RESOURCE_LIMIT                                    \
+#define TRANSPORT_APP_ERROR_RESOURCE_LIMIT                                     \
   QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x102U)
 
 typedef struct {
@@ -154,6 +154,9 @@ typedef struct {
   const char *remote_hosts[TRANSPORT_MAX_PATHS];
   size_t num_remote_hosts;
   uint16_t port;
+  /* QUIC control-session idle timeout in milliseconds. Zero keeps Quicly's
+   * default. */
+  uint64_t quic_idle_timeout_ms;
   const char *cert_file; /* required for server */
   const char *key_file;  /* required for server */
   const char *ca_file;   /* CA bundle path for validating peer certificates */
@@ -165,7 +168,7 @@ typedef struct {
   uint8_t simulated_loss_rate; /* 0 to 100 representing percentage of packets to
                                   drop */
   transport_repair_mode_t repair_mode;
-  transport_limits_t limits;   /* zero fields select documented defaults */
+  transport_limits_t limits; /* zero fields select documented defaults */
 } transport_config_t;
 
 /* create and destroy transport instances */
@@ -200,6 +203,14 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id);
 
 /* subscribe to a media track (client-side) */
 bool transport_subscribe(transport_t *t, moq_track_id_t track_id);
+
+/* Subscribe one authenticated connection. The compatibility wrapper above
+ * broadcasts to every eligible server connection. */
+bool transport_subscribe_conn(transport_t *t, transport_conn_t *conn,
+                              moq_track_id_t track_id);
+
+/* Queue an unsubscribe frame and release the matching local subscription. */
+bool transport_unsubscribe(transport_t *t, moq_track_id_t track_id);
 
 /* request a video keyframe from the publisher (client-side) */
 bool transport_request_keyframe(transport_t *t, moq_track_id_t track_id);
