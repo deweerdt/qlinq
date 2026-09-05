@@ -5,7 +5,9 @@ ARCH = $(shell uname -m)
 
 # Default CFLAGS for our code
 CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DPATHFLOW_ARENA_SIZE=65536
-DEPFLAGS = -MMD -MP
+# Quicly is included with -isystem to keep third-party warnings out of qlinq's
+# build. Use -MD so ABI-affecting Quicly and picotls headers remain tracked.
+DEPFLAGS = -MD -MP
 
 # Include paths: use -isystem for quicly and picotls to suppress warning headers
 INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -Ideps/pathflow -Ideps/pathflow/solvers -isystem deps/quicly/include -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib
@@ -99,7 +101,7 @@ t/%.o: t/%.c
 
 # Rule to compile third-party deps and suppress all warnings with -w
 deps/%.o: deps/%.c
-	$(CC) $(CFLAGS_COMMON) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
+	$(CC) $(CFLAGS_COMMON) $(DEPFLAGS) $(INCLUDES) $(CFLAGS) -w -c $< -o $@
 
 all: qlinqd qlinq-tund
 
@@ -163,6 +165,10 @@ clean:
 	rm -f qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
+	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
+		$(PATHFLOW_OBJS:.o=.d) deps/nanors/rs.d \
+		deps/nanors/deps/obl/oblas_common.d \
+		deps/nanors/deps/obl/oblas_lite.d
 
 check: qlinqd qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack gencerts
 	prove -I. -v t/*.t
@@ -178,4 +184,8 @@ indent:
 
 .PHONY: all clean check benchmark fuzz-wire indent gencerts
 
--include $(shell find src t examples -name "*.d" -print 2>/dev/null)
+-include $(shell find src t examples -name "*.d" -print 2>/dev/null) \
+         $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
+         $(PATHFLOW_OBJS:.o=.d) deps/nanors/rs.d \
+         deps/nanors/deps/obl/oblas_common.d \
+         deps/nanors/deps/obl/oblas_lite.d

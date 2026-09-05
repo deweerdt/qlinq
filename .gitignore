@@ -43,3 +43,4 @@ logs/
 crash-*
 examples/data_multipath_benchmark
 tmp/
+.tmp.dprobes.h

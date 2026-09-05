@@ -7,6 +7,7 @@
 #include "data_uds.h"
 #include "portable_sockets.h"
 #include "transport.h"
+#include <errno.h>
 #include <openssl/crypto.h>
 #include <poll.h>
 #include <signal.h>
@@ -24,6 +25,45 @@ static void handle_signal(int sig) {
 }
 
 #define MAX_TRANSPORTS 16
+
+static bool parse_peer_endpoint(const char *endpoint, char *host,
+                                size_t host_capacity, int *port) {
+  if (!endpoint || !host || host_capacity == 0 || !port)
+    return false;
+  const char *host_start = endpoint;
+  size_t host_len = strlen(endpoint);
+  const char *port_start = NULL;
+  if (endpoint[0] == '[') {
+    const char *closing = strchr(endpoint + 1, ']');
+    if (!closing || (closing[1] != '\0' && closing[1] != ':'))
+      return false;
+    host_start = endpoint + 1;
+    host_len = (size_t)(closing - host_start);
+    if (closing[1] == ':')
+      port_start = closing + 2;
+  } else {
+    const char *first_colon = strchr(endpoint, ':');
+    const char *last_colon = strrchr(endpoint, ':');
+    if (first_colon && first_colon == last_colon) {
+      host_len = (size_t)(first_colon - endpoint);
+      port_start = first_colon + 1;
+    }
+  }
+  if (host_len == 0 || host_len >= host_capacity)
+    return false;
+  memcpy(host, host_start, host_len);
+  host[host_len] = '\0';
+  if (port_start) {
+    char *end = NULL;
+    errno = 0;
+    long parsed = strtol(port_start, &end, 10);
+    if (errno != 0 || !port_start[0] || !end || *end != '\0' || parsed <= 0 ||
+        parsed > UINT16_MAX)
+      return false;
+    *port = (int)parsed;
+  }
+  return true;
+}
 
 struct daemon_ctx_s;
 
@@ -373,20 +413,17 @@ int main(int argc, char **argv) {
   for (size_t i = 0; i < num_peers; i++) {
     /* Create client transport for each peer */
     transport_config_t config = {0};
-    /* parse ip:port */
     char peer_ip[256];
-    strncpy(peer_ip, peers[i], sizeof(peer_ip));
-    peer_ip[sizeof(peer_ip) - 1] = '\0';
-    char *colon = strchr(peer_ip, ':');
     int port = 8888;
-    if (colon) {
-      *colon = '\0';
-      port = atoi(colon + 1);
+    if (!parse_peer_endpoint(peers[i], peer_ip, sizeof(peer_ip), &port)) {
+      fprintf(stderr, "invalid peer endpoint: %s\n", peers[i]);
+      continue;
     }
 
     config.port = port;
     config.remote_hosts[config.num_remote_hosts++] = peer_ip;
-    config.bind_hosts[config.num_bind_hosts++] = "0.0.0.0";
+    config.bind_hosts[config.num_bind_hosts++] =
+        strchr(peer_ip, ':') ? "::" : "0.0.0.0";
     config.cert_file = cert_file;
     config.key_file = key_file;
     config.ca_file = ca_file;

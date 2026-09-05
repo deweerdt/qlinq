@@ -1,5 +1,6 @@
 #include "transport_egress.h"
 
+#include "portable_sockets.h"
 #include "transport_udp.h"
 
 #include <errno.h>
@@ -106,6 +107,11 @@ bool transport_egress_submit(transport_egress_t *egress, int fd,
                                             datagrams, count);
     if (sent < 0) {
       egress->send_errors++;
+      int error = SOCKET_ERROR_CODE;
+      if (error != SOCKET_EAGAIN && error != SOCKET_EWOULDBLOCK &&
+          error != SOCKET_EINTR)
+        return false;
+      egress->would_block++;
     } else {
       first = (size_t)sent;
       for (size_t i = 0; i < first; i++) {

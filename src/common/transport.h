@@ -11,6 +11,8 @@
 #ifndef TRANSPORT_H
 #define TRANSPORT_H
 
+#include "quicly/constants.h"
+
 #include <stdbool.h>
 #include <stddef.h>
 #include <stdint.h>
@@ -129,9 +131,12 @@ typedef struct {
 #define TRANSPORT_MAX_FEC_OBJECT_SIZE (1024U * 1024U)
 #define TRANSPORT_MAX_FEC_RECORD_SIZE UINT16_MAX
 
-#define TRANSPORT_APP_ERROR_PROTOCOL 0x100U
-#define TRANSPORT_APP_ERROR_AUTHENTICATION 0x101U
-#define TRANSPORT_APP_ERROR_RESOURCE_LIMIT 0x102U
+#define TRANSPORT_APP_ERROR_PROTOCOL                                          \
+  QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x100U)
+#define TRANSPORT_APP_ERROR_AUTHENTICATION                                    \
+  QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x101U)
+#define TRANSPORT_APP_ERROR_RESOURCE_LIMIT                                    \
+  QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x102U)
 
 typedef struct {
   const char *bind_hosts[TRANSPORT_MAX_PATHS];
