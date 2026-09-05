@@ -7,6 +7,8 @@
 #include <stddef.h>
 #include <stdint.h>
 
+#define QLINQ_FEC_MAX_TOTAL_SYMBOLS 1024U
+#define QLINQ_FEC_MAX_SYMBOL_SIZE 1500U
 #define TRANSPORT_SENT_CACHE_SIZE 256U
 #define TRANSPORT_FEC_CACHE_SIZE 8U
 
@@ -32,7 +34,7 @@ sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
                                                const moq_track_id_t *track,
                                                uint64_t group_id,
                                                uint64_t object_id);
-void transport_sent_cache_store(transport_sent_cache_t *cache,
+bool transport_sent_cache_store(transport_sent_cache_t *cache,
                                 const moq_object_t *object,
                                 uint16_t total_symbols, uint16_t data_symbols,
                                 uint16_t symbol_size);

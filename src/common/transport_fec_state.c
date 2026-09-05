@@ -11,7 +11,8 @@ static uint64_t get_time_ns(void) {
 }
 
 static bool track_equal(const moq_track_id_t *a, const moq_track_id_t *b) {
-  return a && b && a->type == b->type && strcmp(a->name, b->name) == 0;
+  return a && b && a->type == b->type && a->flags == b->flags &&
+         strcmp(a->name, b->name) == 0;
 }
 
 sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
@@ -29,16 +30,33 @@ sent_object_cache_t *transport_sent_cache_find(transport_sent_cache_t *cache,
   return NULL;
 }
 
-void transport_sent_cache_store(transport_sent_cache_t *cache,
+bool transport_sent_cache_store(transport_sent_cache_t *cache,
                                 const moq_object_t *object,
                                 uint16_t total_symbols, uint16_t data_symbols,
                                 uint16_t symbol_size) {
   if (!cache || !object || !object->data || object->size == 0)
-    return;
+    return false;
+  sent_object_cache_t *existing = transport_sent_cache_find(
+      cache, &object->track_id, object->group_id, object->object_id);
+  if (existing) {
+    /* Publication retries retain one recovery entry. Reusing an identity for
+     * different bytes is invalid because receivers cannot distinguish it. */
+    if (existing->size != object->size ||
+        memcmp(existing->data, object->data, object->size) != 0)
+      return false;
+    if (total_symbols > existing->total_symbols)
+      existing->total_symbols = total_symbols;
+    existing->data_symbols = data_symbols;
+    existing->symbol_size = symbol_size;
+    existing->priority = object->priority;
+    existing->is_keyframe = object->is_keyframe;
+    return true;
+  }
+
   sent_object_cache_t *entry = &cache->entries[cache->next_entry];
   uint8_t *copy = malloc(object->size);
   if (!copy)
-    return;
+    return false;
   memcpy(copy, object->data, object->size);
 
   free(entry->data);
@@ -53,6 +71,7 @@ void transport_sent_cache_store(transport_sent_cache_t *cache,
   entry->symbol_size = symbol_size;
   entry->data = copy;
   cache->next_entry = (cache->next_entry + 1U) % TRANSPORT_SENT_CACHE_SIZE;
+  return true;
 }
 
 void transport_sent_cache_destroy(transport_sent_cache_t *cache) {

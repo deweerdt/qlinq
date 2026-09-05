@@ -17,19 +17,22 @@
 #include <pthread.h>
 #include <stdatomic.h>
 
-#define QLINQ_FEC_MAX_TOTAL_SYMBOLS 1024U
-#define QLINQ_FEC_MAX_SYMBOL_SIZE 1500U
 #define QLINQ_FEC_ASSEMBLER_TIMEOUT_MS 2000
 #define QLINQ_FEC_NACK_DELAY_MS 25
 #define QLINQ_FEC_REPAIR_DEDUP_MS 25
 #define QLINQ_PATH_DATAGRAM_QUEUE_CAPACITY 256U
+#define QLINQ_RECOVERY_HISTORY_OBJECTS 256U
 
 typedef struct {
   uint64_t last_seen;
+  bool seen_initialized;
   uint64_t pending_base;
   uint32_t pending_mask;
   uint64_t group_id;
   int64_t detected_at_ms;
+  uint64_t largest_delivered;
+  uint64_t delivered_mask[QLINQ_RECOVERY_HISTORY_OBJECTS / 64U];
+  bool delivered_initialized;
 } transport_object_gap_state_t;
 
 struct transport_t {

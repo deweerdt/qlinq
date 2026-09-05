@@ -716,10 +716,16 @@ void transport_tick(transport_t *t) {
       for (uint32_t bit = 0; bit < 32 && object_nack_budget > 0; bit++) {
         if ((gap->pending_mask & (1U << bit)) == 0)
           continue;
-        transport_protocol_send_nack(conn, (uint8_t)alias, gap->group_id,
-                                     gap->pending_base + bit, NULL, 0, true);
-        gap->pending_mask &= ~(1U << bit);
-        object_nack_budget--;
+        if (transport_protocol_send_nack(
+                conn, (uint8_t)alias, gap->group_id, gap->pending_base + bit,
+                NULL, 0, true)) {
+          /* Keep the gap pending until a symbol arrives. A NACK being queued
+           * does not guarantee that its repair will be admitted or delivered. */
+          gap->detected_at_ms = now_nack_ms;
+          object_nack_budget--;
+        } else {
+          break;
+        }
       }
     }
 
@@ -767,11 +773,13 @@ void transport_tick(transport_t *t) {
           }
         }
         if (missing_count > 0) {
-          transport_protocol_send_nack(
-              conn, asm_slot->track_id, asm_slot->group_id, asm_slot->object_id,
-              asm_slot->missing_indices, missing_count, false);
-          asm_slot->nack_sent = true;
-          asm_slot->last_nack_time_ms = now_nack_ms;
+          if (transport_protocol_send_nack(
+                  conn, asm_slot->track_id, asm_slot->group_id,
+                  asm_slot->object_id, asm_slot->missing_indices,
+                  missing_count, false)) {
+            asm_slot->nack_sent = true;
+            asm_slot->last_nack_time_ms = now_nack_ms;
+          }
         }
       }
     }

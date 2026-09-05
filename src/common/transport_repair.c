@@ -44,7 +44,8 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
     if (count > TRANSPORT_REPAIR_MAX_SYMBOLS)
       count = TRANSPORT_REPAIR_MAX_SYMBOLS;
     for (size_t i = 0; i < count; i++) {
-      if (missing[i] >= 1024U || !append_unique(batch, missing[i]))
+      if (missing[i] >= QLINQ_FEC_MAX_TOTAL_SYMBOLS ||
+          !append_unique(batch, missing[i]))
         return false;
     }
   }
@@ -59,6 +60,12 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
   size_t parity_symbols = highest >= object->data_symbols
                               ? (size_t)highest - object->data_symbols + 1U
                               : 0U;
+  bool rateless = (object->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
+  size_t original_parity = object->total_symbols >= object->data_symbols
+                               ? object->total_symbols - object->data_symbols
+                               : 0;
+  if (!rateless && parity_symbols < original_parity)
+    parity_symbols = original_parity;
   size_t total_symbols = object->data_symbols + parity_symbols;
   if (total_symbols > UINT16_MAX)
     return false;
@@ -100,7 +107,8 @@ bool transport_repair_build(transport_fec_cache_t *fec_cache,
   if (parity_symbols > 0) {
     for (size_t i = 0; i < parity_symbols; i++)
       parity_blocks[i] = parity_storage + i * object->symbol_size;
-    fec_type_t type = total_symbols > 255 ? FEC_RAPTORQ : FEC_REED_SOLOMON;
+    fec_type_t type =
+        rateless || total_symbols > 255 ? FEC_RAPTORQ : FEC_REED_SOLOMON;
     fec_t *fec = transport_fec_cache_get(fec_cache, type, object->data_symbols,
                                          parity_symbols, object->symbol_size);
     encoded = fec && fec_encode(fec, (const uint8_t *const *)data_blocks,

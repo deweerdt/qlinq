@@ -137,11 +137,27 @@ int main(void) {
                          .size = sizeof(object_data),
                          .priority = 2};
   transport_sent_cache_t sent_cache = {0};
-  transport_sent_cache_store(&sent_cache, &object, 3, 2, 2);
+  CHECK(transport_sent_cache_store(&sent_cache, &object, 3, 2, 2),
+        "sent-object cache store");
   sent_object_cache_t *cached =
       transport_sent_cache_find(&sent_cache, &track, 10, 20);
   CHECK(cached && cached->size == sizeof(object_data) && cached->data[3] == 4,
         "sent-object cache roundtrip");
+  size_t next_cache_entry = sent_cache.next_entry;
+  CHECK(transport_sent_cache_store(&sent_cache, &object, 4, 2, 2) &&
+            sent_cache.next_entry == next_cache_entry &&
+            cached->total_symbols == 4,
+        "publication retry reuses sent-object cache identity");
+  const uint8_t conflicting_data[] = {4, 3, 2, 1};
+  object.data = conflicting_data;
+  CHECK(!transport_sent_cache_store(&sent_cache, &object, 4, 2, 2),
+        "conflicting sent-object identity rejected");
+  object.data = object_data;
+  moq_track_id_t different_profile = track;
+  different_profile.flags ^= MOQ_TRACK_FLAG_FEC_RATELESS;
+  CHECK(transport_sent_cache_find(&sent_cache, &different_profile, 10, 20) ==
+            NULL,
+        "sent-object cache includes track flags in identity");
 
   uint16_t missing_symbol = 1;
   transport_repair_batch_t repair;
@@ -152,6 +168,12 @@ int main(void) {
   CHECK(repair.count == 1 && repair.indices[0] == 1 &&
             repair.symbols[0] == object_data[2],
         "repair returns requested data symbol");
+  transport_repair_batch_destroy(&repair);
+  uint16_t parity_symbol = 2;
+  CHECK(transport_repair_build(&repair_fec_cache, cached, false,
+                               &parity_symbol, 1, &repair) &&
+            repair.total_symbols == cached->total_symbols,
+        "repair preserves original FEC dimensions");
   transport_repair_batch_destroy(&repair);
   CHECK(transport_repair_build(&repair_fec_cache, cached, true, NULL, 0,
                                &repair) &&

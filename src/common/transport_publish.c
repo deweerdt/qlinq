@@ -20,7 +20,8 @@ static transport_publish_result_t
 publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
                          const moq_object_t *obj,
                          const transport_track_profile_t *profile,
-                         size_t symbol_size, size_t data_symbols) {
+                         size_t symbol_size, size_t data_symbols,
+                         uint16_t *sent_total_symbols) {
   transport_schedule_t schedule;
   bool use_fec = profile->fec_enabled || profile->fec_rateless;
   if (!transport_schedule_build(&t->scheduler_context, conn->quic,
@@ -33,6 +34,8 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
   size_t total_symbols = data_symbols + parity_symbols;
   if (total_symbols > QLINQ_FEC_MAX_TOTAL_SYMBOLS || total_symbols > UINT16_MAX)
     return TRANSPORT_PUBLISH_INVALID;
+  if (sent_total_symbols)
+    *sent_total_symbols = (uint16_t)total_symbols;
 
   uint8_t **data_blocks =
       transport_arena_alloc(&t->arena, data_symbols * sizeof(*data_blocks));
@@ -69,12 +72,9 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
   }
 
   if (parity_symbols > 0) {
-    fec_type_t fec_type =
-        total_symbols > 255 || obj->track_id.type == MOQ_TRACK_DATA
-            ? FEC_RAPTORQ
-            : FEC_REED_SOLOMON;
-    if (fec_type == FEC_RAPTORQ && total_symbols <= 255)
-      fec_type = FEC_REED_SOLOMON;
+    fec_type_t fec_type = profile->fec_rateless || total_symbols > 255
+                              ? FEC_RAPTORQ
+                              : FEC_REED_SOLOMON;
     fec_t *fec = transport_fec_cache_get(&t->fec_cache, fec_type, data_symbols,
                                          parity_symbols, symbol_size);
     if (!fec ||
@@ -358,6 +358,7 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
       t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
   size_t eligible = 0;
   size_t delivered = 0;
+  uint16_t maximum_sent_symbols = (uint16_t)data_symbols;
   bool partially_queued = false;
   transport_publish_result_t failure = TRANSPORT_PUBLISH_ERROR;
 
@@ -373,8 +374,11 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
       failure = TRANSPORT_PUBLISH_INVALID;
       continue;
     }
+    uint16_t sent_symbols = 0;
     transport_publish_result_t result = publish_datagram_to_conn(
-        t, conn, obj, &profile, symbol_size, data_symbols);
+        t, conn, obj, &profile, symbol_size, data_symbols, &sent_symbols);
+    if (sent_symbols > maximum_sent_symbols)
+      maximum_sent_symbols = sent_symbols;
     if (result == TRANSPORT_PUBLISH_DELIVERED) {
       delivered++;
     } else if (result == TRANSPORT_PUBLISH_NO_RECIPIENTS) {
@@ -388,9 +392,11 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
   }
 
   if ((delivered > 0 || partially_queued) &&
-      obj->track_id.type == MOQ_TRACK_DATA)
-    transport_sent_cache_store(&t->sent_cache, obj, (uint16_t)data_symbols,
-                               (uint16_t)data_symbols, (uint16_t)symbol_size);
+      obj->track_id.type == MOQ_TRACK_DATA &&
+      !transport_sent_cache_store(&t->sent_cache, obj, maximum_sent_symbols,
+                                  (uint16_t)data_symbols,
+                                  (uint16_t)symbol_size))
+    return delivered > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
 
   if (partially_queued || (delivered > 0 && delivered != eligible))
     return TRANSPORT_PUBLISH_PARTIAL;

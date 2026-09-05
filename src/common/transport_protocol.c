@@ -138,6 +138,74 @@ static bool repair_request_allowed(transport_conn_t *conn,
   return true;
 }
 
+static bool object_was_delivered(const transport_object_gap_state_t *state,
+                                 uint64_t object_id) {
+  if (!state->delivered_initialized || object_id > state->largest_delivered)
+    return false;
+  uint64_t distance = state->largest_delivered - object_id;
+  if (distance >= QLINQ_RECOVERY_HISTORY_OBJECTS)
+    return true;
+  return (state->delivered_mask[distance / 64U] &
+          (UINT64_C(1) << (distance % 64U))) != 0;
+}
+
+static void mark_object_delivered(transport_object_gap_state_t *state,
+                                  uint64_t object_id) {
+  if (!state->delivered_initialized) {
+    state->delivered_initialized = true;
+    state->largest_delivered = object_id;
+    state->delivered_mask[0] = 1;
+    return;
+  }
+  if (object_id > state->largest_delivered) {
+    uint64_t distance = object_id - state->largest_delivered;
+    uint64_t shifted[QLINQ_RECOVERY_HISTORY_OBJECTS / 64U] = {0};
+    if (distance < QLINQ_RECOVERY_HISTORY_OBJECTS) {
+      size_t word_shift = (size_t)(distance / 64U);
+      unsigned bit_shift = (unsigned)(distance % 64U);
+      for (size_t dst = QLINQ_RECOVERY_HISTORY_OBJECTS / 64U; dst-- > 0;) {
+        if (dst < word_shift)
+          continue;
+        size_t src = dst - word_shift;
+        shifted[dst] = state->delivered_mask[src] << bit_shift;
+        if (bit_shift != 0 && src > 0)
+          shifted[dst] |= state->delivered_mask[src - 1U] >> (64U - bit_shift);
+      }
+    }
+    memcpy(state->delivered_mask, shifted, sizeof(shifted));
+    state->delivered_mask[0] |= 1;
+    state->largest_delivered = object_id;
+  } else {
+    uint64_t distance = state->largest_delivered - object_id;
+    if (distance < QLINQ_RECOVERY_HISTORY_OBJECTS)
+      state->delivered_mask[distance / 64U] |= UINT64_C(1) << (distance % 64U);
+  }
+}
+
+static bool queue_missing_objects(transport_object_gap_state_t *state,
+                                  uint64_t group_id, uint64_t first_missing,
+                                  uint64_t missing_count) {
+  if (!state || missing_count == 0)
+    return true;
+  if (missing_count > 32)
+    return false;
+  if (state->pending_mask == 0) {
+    state->pending_base = first_missing;
+    state->detected_at_ms = transport_get_time_ms();
+    state->group_id = group_id;
+  }
+  if (first_missing < state->pending_base ||
+      first_missing - state->pending_base >= 32)
+    return false;
+  uint32_t offset = (uint32_t)(first_missing - state->pending_base);
+  uint32_t available = 32 - offset;
+  uint32_t count =
+      missing_count < available ? (uint32_t)missing_count : available;
+  uint32_t bits = count == 32 ? UINT32_MAX : ((1U << count) - 1U);
+  state->pending_mask |= bits << offset;
+  return count == missing_count;
+}
+
 /* Parse complete, versioned control frames from the stream buffer. */
 static void parse_control_messages(transport_t *t, transport_conn_t *conn,
                                    quicly_stream_t *stream) {
@@ -568,36 +636,39 @@ static quicly_error_t on_stream_open(quicly_stream_open_t *self,
 }
 
 /* handle incoming datagram frames */
-void transport_protocol_send_nack(transport_conn_t *conn, uint8_t alias,
+bool transport_protocol_send_nack(transport_conn_t *conn, uint8_t alias,
                                   uint64_t group_id, uint64_t object_id,
                                   const uint16_t *missing, uint16_t count,
                                   bool whole_object) {
   if (!conn || !conn->stream ||
       !quicly_sendstate_is_open(&conn->stream->sendstate))
-    return;
+    return false;
 
   if (count > QLINQ_WIRE_MAX_NACK_SYMBOLS)
-    return;
+    return false;
   size_t payload_len = 20U + (size_t)count * 2U;
   uint8_t static_buf[1024];
   uint8_t *buf = static_buf;
   if (payload_len > sizeof(static_buf)) {
     buf = malloc(payload_len);
     if (!buf)
-      return;
+      return false;
   }
 
   size_t written = 0;
+  bool sent = false;
   uint8_t flags = whole_object ? QLINQ_WIRE_NACK_WHOLE_OBJECT : 0;
   if (qlinq_wire_encode_nack(buf, payload_len, alias, flags, group_id,
                              object_id, missing, count,
-                             &written) == QLINQ_WIRE_OK)
-    (void)transport_stream_write_frame(conn->stream, QLINQ_WIRE_NACK, buf,
-                                       written);
+                             &written) == QLINQ_WIRE_OK &&
+      transport_stream_write_frame(conn->stream, QLINQ_WIRE_NACK, buf,
+                                   written))
+    sent = true;
 
   if (buf != static_buf) {
     free(buf);
   }
+  return sent;
 }
 
 static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
@@ -701,29 +772,26 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
   if (payload.len != QLINQ_WIRE_FEC_HEADER_SIZE + symbol_size)
     goto malformed_datagram;
 
-  if (resolved_track.type == MOQ_TRACK_DATA &&
-      (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS)) {
-    transport_object_gap_state_t *gap = &tconn->object_gaps[track_id];
-    if (object_id > gap->last_seen) {
-      if (gap->last_seen > 0 && object_id - gap->last_seen > 1) {
+  bool rateless_data =
+      resolved_track.type == MOQ_TRACK_DATA &&
+      (resolved_track.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0;
+  transport_object_gap_state_t *object_state = &tconn->object_gaps[track_id];
+  if (rateless_data && object_was_delivered(object_state, object_id)) {
+    t->stats.fec_duplicate_objects_suppressed++;
+    return;
+  }
+
+  if (rateless_data) {
+    transport_object_gap_state_t *gap = object_state;
+    if (!gap->seen_initialized) {
+      gap->seen_initialized = true;
+      gap->last_seen = object_id;
+    } else if (object_id > gap->last_seen) {
+      if (object_id - gap->last_seen > 1) {
         uint64_t first_missing = gap->last_seen + 1;
         uint64_t missing_count = object_id - first_missing;
-        if (missing_count <= 32) {
-          if (gap->pending_mask == 0) {
-            gap->pending_base = first_missing;
-            gap->detected_at_ms = transport_get_time_ms();
-            gap->group_id = group_id;
-          }
-          if (first_missing >= gap->pending_base &&
-              first_missing - gap->pending_base < 32) {
-            uint32_t offset = (uint32_t)(first_missing - gap->pending_base);
-            uint32_t available = 32 - offset;
-            uint32_t count =
-                missing_count < available ? missing_count : available;
-            uint32_t bits = count == 32 ? UINT32_MAX : ((1U << count) - 1U);
-            gap->pending_mask |= bits << offset;
-          }
-        }
+        (void)queue_missing_objects(gap, group_id, first_missing,
+                                    missing_count);
       }
       gap->last_seen = object_id;
     } else if (gap->pending_mask != 0 && object_id >= gap->pending_base &&
@@ -835,8 +903,9 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
     } else {
       size_t parity_symbols = total_symbols - data_symbols;
       if (parity_symbols > 0) {
-        fec_type_t fec_type =
-            total_symbols > 255 ? FEC_RAPTORQ : FEC_REED_SOLOMON;
+        fec_type_t fec_type = rateless_data || total_symbols > 255
+                                  ? FEC_RAPTORQ
+                                  : FEC_REED_SOLOMON;
         fec_t *fec = transport_fec_cache_get(
             &t->fec_cache, fec_type, data_symbols, parity_symbols, symbol_size);
         if (fec) {
@@ -873,6 +942,8 @@ static void on_receive_datagram_frame(quicly_receive_datagram_frame_t *self,
                                          .size = original_size,
                                          .is_keyframe = (is_keyframe != 0),
                                          .priority = asm_slot->priority}};
+      if (rateless_data)
+        mark_object_delivered(object_state, object_id);
       t->stats.fec_objects_recovered++;
       transport_emit_event(t, &ev);
       free(full_data);

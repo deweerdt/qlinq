@@ -230,6 +230,7 @@ typedef struct {
   uint64_t malformed_datagrams;
   uint64_t fec_objects_recovered;
   uint64_t fec_objects_lost;
+  uint64_t fec_duplicate_objects_suppressed;
   uint64_t repair_requests_received;
   uint64_t repair_requests_throttled;
   uint64_t events_emitted;
