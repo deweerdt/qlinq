@@ -59,7 +59,7 @@ size_t transport_path_find_by_link(quicly_conn_t *quic,
                                    const struct sockaddr_storage *local_addrs,
                                    size_t num_local_addrs, size_t link_index) {
   if (!quic || !local_addrs || link_index >= num_local_addrs)
-    return 0;
+    return SIZE_MAX;
   for (size_t p = 0; p < TRANSPORT_MAX_QUIC_PATHS; p++) {
     quicly_path_stats_t stats;
     if (quicly_get_path_stats(quic, p, &stats) == 0 &&
@@ -67,7 +67,7 @@ size_t transport_path_find_by_link(quicly_conn_t *quic,
             &stats.local.sa, (const struct sockaddr *)&local_addrs[link_index]))
       return p;
   }
-  return 0;
+  return SIZE_MAX;
 }
 
 size_t transport_path_select_physical(const path_t *paths, size_t num_paths,

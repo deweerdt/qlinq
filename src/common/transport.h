@@ -149,8 +149,15 @@ typedef struct {
   QUICLY_ERROR_FROM_APPLICATION_ERROR_CODE(0x102U)
 
 typedef struct {
+  /* For clients, bind_hosts[i] uses remote_hosts[i]. When exactly one remote
+   * host is supplied, every local address uses that endpoint. Hot-added local
+   * addresses take the next compatible, unused remote endpoint. */
   const char *bind_hosts[TRANSPORT_MAX_PATHS];
   size_t num_bind_hosts;
+  /* Optional exact-name allowlist for interfaces discovered after startup.
+   * Zero entries accept every monitored interface. */
+  const char *path_interface_names[TRANSPORT_MAX_PATHS];
+  size_t num_path_interface_names;
   const char *remote_hosts[TRANSPORT_MAX_PATHS];
   size_t num_remote_hosts;
   uint16_t port;
@@ -315,6 +322,9 @@ typedef struct {
   uint64_t stream_frames_received;
   uint64_t datagrams_received;
   uint64_t malformed_datagrams;
+  uint64_t quic_paths_created;
+  uint64_t quic_paths_validated;
+  uint64_t quic_paths_validation_failed;
 } transport_conn_stats_t;
 
 /* Snapshot aggregate or per-connection observability. These functions follow

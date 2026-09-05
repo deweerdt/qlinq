@@ -84,8 +84,13 @@ struct transport_t {
   socklen_t local_addrs_len[TRANSPORT_MAX_PATHS];
   uint32_t local_ifindices[TRANSPORT_MAX_PATHS];
   char local_ifnames[TRANSPORT_MAX_PATHS][64];
+  char path_interface_names[TRANSPORT_MAX_PATHS][64];
+  size_t num_path_interface_names;
   uint64_t udp_bytes_received[TRANSPORT_MAX_PATHS];
   transport_egress_t egress[TRANSPORT_MAX_PATHS];
+  size_t local_remote_indices[TRANSPORT_MAX_PATHS];
+  bool path_open_pending[TRANSPORT_MAX_PATHS];
+  uint64_t path_open_retry_at[TRANSPORT_MAX_PATHS];
   transport_limits_t limits;
   transport_stats_t stats;
   atomic_uint_fast64_t cross_thread_violations;

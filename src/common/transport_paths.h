@@ -11,6 +11,7 @@
 
 #define TRANSPORT_MAX_QUIC_PATHS 64U
 
+/* Both lookup helpers return SIZE_MAX when no QUIC path matches. */
 size_t transport_path_find_by_addresses(quicly_conn_t *quic,
                                         const struct sockaddr *local,
                                         const struct sockaddr *remote);

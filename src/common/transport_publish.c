@@ -16,16 +16,30 @@
 #include <stdlib.h>
 #include <string.h>
 
-static transport_publish_result_t
-publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
-                         const moq_object_t *obj,
-                         const transport_track_profile_t *profile,
-                         size_t symbol_size, size_t data_symbols,
-                         uint16_t *sent_total_symbols) {
+static transport_publish_result_t publish_datagram_to_conn(
+    transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
+    const transport_track_profile_t *profile, size_t symbol_size,
+    size_t data_symbols, uint16_t *sent_total_symbols) {
+  size_t active_physical[TRANSPORT_MAX_PATHS];
+  path_state_t active_states[TRANSPORT_MAX_PATHS];
+  size_t active_paths = 0;
+  for (size_t physical = 0; physical < t->num_fds; physical++) {
+    size_t mapped = transport_path_find_by_link(conn->quic, t->local_addrs,
+                                                t->num_fds, physical);
+    if (mapped >= TRANSPORT_MAX_QUIC_PATHS ||
+        !quicly_is_path_available(conn->quic, mapped))
+      continue;
+    active_physical[active_paths] = physical;
+    active_states[active_paths] = conn->path_states[physical];
+    active_paths++;
+  }
+  if (active_paths == 0)
+    return TRANSPORT_PUBLISH_BACKPRESSURE;
+
   transport_schedule_t schedule;
   bool use_fec = profile->fec_enabled || profile->fec_rateless;
   if (!transport_schedule_build(&t->scheduler_context, conn->quic,
-                                conn->path_states, t->num_fds, data_symbols,
+                                active_states, active_paths, data_symbols,
                                 symbol_size, use_fec, obj->priority,
                                 &t->round_robin_path, &schedule))
     return TRANSPORT_PUBLISH_ERROR;
@@ -86,8 +100,9 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
 
   uint16_t needed[TRANSPORT_MAX_QUIC_PATHS] = {0};
   for (size_t s = 0; s < total_symbols; s++) {
-    size_t physical =
-        transport_path_select_physical(schedule.paths, t->num_fds, s);
+    size_t scheduled =
+        transport_path_select_physical(schedule.paths, active_paths, s);
+    size_t physical = active_physical[scheduled];
     size_t mapped = transport_path_find_by_link(conn->quic, t->local_addrs,
                                                 t->num_fds, physical);
     if (mapped >= TRANSPORT_MAX_QUIC_PATHS ||
@@ -114,8 +129,9 @@ publish_datagram_to_conn(transport_t *t, transport_conn_t *conn,
       transport_arena_reset(&t->arena);
       return queued > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
     }
-    size_t physical =
-        transport_path_select_physical(schedule.paths, t->num_fds, s);
+    size_t scheduled =
+        transport_path_select_physical(schedule.paths, active_paths, s);
+    size_t physical = active_physical[scheduled];
     size_t mapped = transport_path_find_by_link(conn->quic, t->local_addrs,
                                                 t->num_fds, physical);
     if (mapped > UINT8_MAX) {
@@ -173,8 +189,8 @@ find_fec_track_state(transport_t *t, const moq_track_id_t *track_id,
   return available;
 }
 
-static bool checkpoint_ack_pending(
-    const transport_checkpoint_ack_state_t *state) {
+static bool
+checkpoint_ack_pending(const transport_checkpoint_ack_state_t *state) {
   return state && state->sent_initialized &&
          (!state->acked_initialized ||
           state->acked_group_id != state->sent_group_id ||
@@ -399,7 +415,8 @@ transport_publish_flush_grouped_ex(transport_t *t) {
   t->fec_buf_len = 0;
   t->fec_first_pkt_time = 0;
   t->fec_pkt_count = 0;
-  if (track_state->next_object_id % QLINQ_RECOVERY_WINDOW_OBJECTS == 0) {
+  if ((track_state->track_id.flags & MOQ_TRACK_FLAG_FEC_RATELESS) != 0 &&
+      track_state->next_object_id % QLINQ_RECOVERY_WINDOW_OBJECTS == 0) {
     uint64_t first_object_id =
         track_state->next_object_id - QLINQ_RECOVERY_WINDOW_OBJECTS;
     (void)emit_rolling_checkpoint(t, track_state, 0, first_object_id,
@@ -665,8 +682,7 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
   if ((delivered > 0 || partially_queued) &&
       obj->track_id.type == MOQ_TRACK_DATA &&
       !transport_sent_cache_store(&t->sent_cache, obj, maximum_sent_symbols,
-                                  (uint16_t)data_symbols,
-                                  (uint16_t)symbol_size,
+                                  (uint16_t)data_symbols, (uint16_t)symbol_size,
                                   !protect_repair_cache))
     return delivered > 0 ? TRANSPORT_PUBLISH_PARTIAL : TRANSPORT_PUBLISH_ERROR;
 
@@ -715,11 +731,11 @@ bool transport_finish_track(transport_t *t, moq_track_id_t track_id) {
     if (transport_stream_write_track_end_frame(conn->stream, alias, 0,
                                                final_object_id)) {
       t->stats.track_ends_sent++;
-      if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) != 0) {
+      if ((conn->peer_capabilities & QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS) !=
+          0) {
         if (!conn->checkpoint_acks[alias].participating)
           transport_publish_checkpoint_member_added(t, conn, &track_id, alias);
-        checkpoint_mark_sent(&conn->checkpoint_acks[alias], 0,
-                             final_object_id);
+        checkpoint_mark_sent(&conn->checkpoint_acks[alias], 0, final_object_id);
       }
     } else {
       succeeded = false;

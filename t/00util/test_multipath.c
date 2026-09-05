@@ -24,12 +24,14 @@ typedef struct {
   uint8_t received_data[100];
   size_t received_size;
   transport_t *transport;
+  transport_conn_t *conn;
 } test_state_t;
 
 static void on_server_event(void *user_data, const transport_event_t *event) {
   test_state_t *state = user_data;
   switch (event->type) {
   case TRANSPORT_EVENT_CONNECTED:
+    state->conn = event->conn;
     state->connected = true;
     break;
   case TRANSPORT_EVENT_SUBSCRIBE:
@@ -50,6 +52,7 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
   test_state_t *state = user_data;
   switch (event->type) {
   case TRANSPORT_EVENT_CONNECTED:
+    state->conn = event->conn;
     transport_send_auth(state->transport, event->conn,
                         (const uint8_t *)"secret", 6);
     break;
@@ -119,12 +122,83 @@ static void drain_qlog(int log_fd) {
   }
 }
 
+static bool test_single_remote_fanout(void) {
+  test_state_t server_state = {0};
+  test_state_t client_state = {0};
+
+  transport_config_t server_cfg = {0};
+  server_cfg.bind_hosts[0] = "127.70.1.1";
+  server_cfg.num_bind_hosts = 1;
+  server_cfg.port = 9877;
+  server_cfg.cert_file = "t/assets/server.crt";
+  server_cfg.key_file = "t/assets/server.key";
+  server_cfg.callback = on_server_event;
+  server_cfg.allow_insecure_peer = true;
+  server_cfg.user_data = &server_state;
+
+  transport_config_t client_cfg = {0};
+  client_cfg.bind_hosts[0] = "127.71.1.2";
+  client_cfg.bind_hosts[1] = "127.72.2.23";
+  client_cfg.bind_hosts[2] = "127.73.3.34";
+  client_cfg.num_bind_hosts = 3;
+  client_cfg.remote_hosts[0] = "127.70.1.1";
+  client_cfg.num_remote_hosts = 1;
+  client_cfg.port = 9877;
+  client_cfg.callback = on_client_event;
+  client_cfg.allow_insecure_peer = true;
+  client_cfg.user_data = &client_state;
+
+  transport_t *server = transport_create(&server_cfg);
+  if (!server)
+    return false;
+  server_state.transport = server;
+  transport_t *client = transport_create(&client_cfg);
+  if (!client) {
+    transport_destroy(server);
+    return false;
+  }
+  client_state.transport = client;
+
+  transport_conn_stats_t stats = {0};
+  int retries = 300;
+  while (retries-- > 0) {
+    transport_tick(server);
+    transport_tick(client);
+    if (server_state.connected && client_state.connected && client_state.conn &&
+        transport_get_conn_stats(client, client_state.conn, &stats) &&
+        stats.quic_paths_validated >= 2)
+      break;
+    usleep(10 * 1000);
+  }
+
+  bool ok = server_state.connected && client_state.connected &&
+            client_state.conn &&
+            transport_get_conn_stats(client, client_state.conn, &stats) &&
+            stats.quic_paths_created >= 2 && stats.quic_paths_validated >= 2 &&
+            stats.quic_paths_validation_failed == 0;
+  if (!ok)
+    fprintf(stderr,
+            "single-remote path validation failed: created=%lu "
+            "validated=%lu failed=%lu\n",
+            (unsigned long)stats.quic_paths_created,
+            (unsigned long)stats.quic_paths_validated,
+            (unsigned long)stats.quic_paths_validation_failed);
+
+  transport_destroy(client);
+  transport_destroy(server);
+  return ok;
+}
+
 #include <signal.h>
 
 int main(void) {
   signal(SIGPIPE, SIG_IGN);
   const char *qlog_path = "tmp/test_qlog.sock";
   mkdir("tmp", 0777);
+
+  printf("testing multiple local interfaces with one remote endpoint...\n");
+  if (!test_single_remote_fanout())
+    return 1;
 
   int listener_fd = setup_qlog_listener(qlog_path);
   if (listener_fd < 0) {
@@ -135,12 +209,12 @@ int main(void) {
   test_state_t server_state = {0};
   test_state_t client_state = {0};
 
-  /* server binds to 4 loopback IPs */
+  /* These loopback tuples deliberately do not share /24 prefixes. */
   transport_config_t server_cfg = {0};
   server_cfg.bind_hosts[0] = "127.0.1.1";
-  server_cfg.bind_hosts[1] = "127.0.2.1";
-  server_cfg.bind_hosts[2] = "127.0.3.1";
-  server_cfg.bind_hosts[3] = "127.0.4.1";
+  server_cfg.bind_hosts[1] = "127.10.2.41";
+  server_cfg.bind_hosts[2] = "127.20.3.77";
+  server_cfg.bind_hosts[3] = "127.30.4.99";
   server_cfg.num_bind_hosts = 4;
   server_cfg.port = 9876;
   server_cfg.cert_file = "t/assets/server.crt";
@@ -149,14 +223,15 @@ int main(void) {
   server_cfg.allow_insecure_peer = true;
   server_cfg.user_data = &server_state;
 
-  /* client initially binds only to 127.0.1.2 */
+  /* Start with two configured local paths; add the other two at runtime. */
   transport_config_t client_cfg = {0};
   client_cfg.bind_hosts[0] = "127.0.1.2";
-  client_cfg.num_bind_hosts = 1;
+  client_cfg.bind_hosts[1] = "127.40.9.12";
+  client_cfg.num_bind_hosts = 2;
   client_cfg.remote_hosts[0] = "127.0.1.1";
-  client_cfg.remote_hosts[1] = "127.0.2.1";
-  client_cfg.remote_hosts[2] = "127.0.3.1";
-  client_cfg.remote_hosts[3] = "127.0.4.1";
+  client_cfg.remote_hosts[1] = "127.10.2.41";
+  client_cfg.remote_hosts[2] = "127.20.3.77";
+  client_cfg.remote_hosts[3] = "127.30.4.99";
   client_cfg.num_remote_hosts = 4;
   client_cfg.port = 9876;
   client_cfg.cert_file = NULL;
@@ -234,19 +309,42 @@ int main(void) {
     return 1;
   }
 
-  /* mock local interface additions with matching client suffix .2 */
+  /* The hot-added addresses also have unrelated prefixes and host octets. */
   printf("triggering secondary loopback path validation...\n");
-  transport_mock_iface_add(client, "127.0.2.2");
-  transport_mock_iface_add(client, "127.0.3.2");
-  transport_mock_iface_add(client, "127.0.4.2");
+  transport_mock_iface_add(client, "127.50.8.23");
+  transport_mock_iface_add(client, "127.60.7.34");
 
   /* tick transports to process interface updates and complete validation */
   retries = 200;
+  transport_conn_stats_t conn_stats = {0};
   while (retries-- > 0) {
     transport_tick(server);
     transport_tick(client);
     drain_qlog(log_fd);
+    if (client_state.conn &&
+        transport_get_conn_stats(client, client_state.conn, &conn_stats) &&
+        conn_stats.quic_paths_validated >= 3)
+      break;
     usleep(10 * 1000);
+  }
+
+  if (!client_state.conn ||
+      !transport_get_conn_stats(client, client_state.conn, &conn_stats) ||
+      conn_stats.quic_paths_created < 3 ||
+      conn_stats.quic_paths_validated < 3 ||
+      conn_stats.quic_paths_validation_failed != 0) {
+    fprintf(stderr,
+            "secondary path validation failed: created=%lu validated=%lu "
+            "failed=%lu\n",
+            (unsigned long)conn_stats.quic_paths_created,
+            (unsigned long)conn_stats.quic_paths_validated,
+            (unsigned long)conn_stats.quic_paths_validation_failed);
+    close(log_fd);
+    transport_destroy(client);
+    transport_destroy(server);
+    close(listener_fd);
+    unlink(qlog_path);
+    return 1;
   }
 
   /* subscribe to video track */
@@ -311,18 +409,17 @@ int main(void) {
     return 1;
   }
 
-  /* verify path statistics and count active paths */
-  int path_count = 0;
+  /* Verify all four local sockets remain observable. */
+  int socket_count = 0;
   for (size_t i = 0; i < 4; i++) {
     transport_path_stats_t stats;
-    if (transport_get_path_stats(client, i, &stats)) {
-      path_count++;
-    }
+    if (transport_get_path_stats(client, i, &stats))
+      socket_count++;
   }
 
-  if (path_count < 4) {
-    fprintf(stderr, "not all 4 paths were successfully established: count=%d\n",
-            path_count);
+  if (socket_count < 4) {
+    fprintf(stderr, "not all 4 path sockets are active: count=%d\n",
+            socket_count);
     close(log_fd);
     transport_destroy(client);
     transport_destroy(server);

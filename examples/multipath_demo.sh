@@ -35,7 +35,12 @@ unshare -Urn bash -c '
     echo "====================================================="
     # We pass all potential remote IPs so the client knows them.
     # We only pass the first local IPs to start, the rest will be dynamically discovered.
-    ./examples/data_multipath_benchmark --server-bind 10.0.1.1 --client-bind 10.0.1.2 --client-remote 10.0.1.1 10.0.2.1 10.0.3.1 10.0.4.1 &
+    ./examples/data_multipath_benchmark \
+        --server-bind 10.0.1.1 \
+        --server-interface veth1 veth2 veth3 veth4 \
+        --client-bind 10.0.1.2 \
+        --client-interface veth1_peer veth2_peer veth3_peer veth4_peer \
+        --client-remote 10.0.1.1 10.0.2.1 10.0.3.1 10.0.4.1 &
     BENCH_PID=$!
     
     sleep 2

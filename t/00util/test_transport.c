@@ -437,6 +437,47 @@ int main(void) {
     return 1;
   }
 
+  /* Indexed FEC uses the grouped-object path, but rolling recovery
+   * checkpoints are rateless-only. Cross the 32-object checkpoint boundary
+   * and verify that the indexed session remains open. */
+  for (uint64_t i = 0; i < 132; i++) {
+    moq_object_t indexed_record = {.track_id = data_a,
+                                   .object_id = 100 + i,
+                                   .data = packet_a,
+                                   .size = sizeof(packet_a),
+                                   .priority = 1};
+    if (!transport_publish(server, &indexed_record)) {
+      fprintf(stderr,
+              "indexed FEC checkpoint-boundary publication failed at record "
+              "%" PRIu64 "\n",
+              i);
+      transport_destroy(client);
+      transport_destroy(server);
+      return 1;
+    }
+  }
+  retries = 100;
+  while (retries-- > 0) {
+    transport_tick(server);
+    transport_tick(client);
+    usleep(5 * 1000);
+  }
+  transport_stats_t indexed_source_stats = {0};
+  transport_stats_t indexed_receiver_stats = {0};
+  if (!transport_get_stats(server, &indexed_source_stats) ||
+      !transport_get_stats(client, &indexed_receiver_stats) ||
+      indexed_source_stats.active_connections != 1 ||
+      indexed_receiver_stats.active_connections != 1 ||
+      indexed_source_stats.recovery_checkpoints_sent != 0 ||
+      indexed_receiver_stats.recovery_checkpoints_received != 0 ||
+      indexed_source_stats.protocol_errors != 0 ||
+      indexed_receiver_stats.protocol_errors != 0) {
+    fprintf(stderr, "indexed FEC incorrectly entered checkpoint recovery\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
   moq_track_id_t checkpoint_track = {.type = MOQ_TRACK_DATA,
                                      .flags = MOQ_TRACK_FLAG_FEC_RATELESS,
                                      .name = "checkpoint-data"};

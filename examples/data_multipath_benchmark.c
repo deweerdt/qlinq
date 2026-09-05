@@ -21,6 +21,7 @@ typedef struct {
 
 typedef struct {
   bool connected;
+  bool disconnected;
   bool subscribed;
   bool use_reliable;
   frame_metrics_t packets[MAX_PACKETS];
@@ -47,6 +48,10 @@ static void on_server_event(void *user_data, const transport_event_t *event) {
     break;
   case TRANSPORT_EVENT_AUTH:
     transport_respond_auth(state->transport, event->conn, true);
+    break;
+  case TRANSPORT_EVENT_DISCONNECTED:
+    state->connected = false;
+    state->disconnected = true;
     break;
   default:
     break;
@@ -91,6 +96,10 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
       }
     }
     break;
+  case TRANSPORT_EVENT_DISCONNECTED:
+    state->connected = false;
+    state->disconnected = true;
+    break;
   default:
     break;
   }
@@ -102,6 +111,10 @@ int main(int argc, char **argv) {
   int num_server_bind = 1;
   const char *client_bind_hosts[4] = {"0.0.0.0"};
   int num_client_bind = 1;
+  const char *server_path_interfaces[4] = {0};
+  int num_server_path_interfaces = 0;
+  const char *client_path_interfaces[4] = {0};
+  int num_client_path_interfaces = 0;
   const char *client_remote_hosts[4] = {"127.0.0.1"};
   int num_client_remote = 1;
   const char *qlog_socket = NULL;
@@ -121,6 +134,16 @@ int main(int argc, char **argv) {
       while (i + 1 < argc && argv[i + 1][0] != '-') {
         client_bind_hosts[num_client_bind++] = argv[++i];
       }
+    } else if (strcmp(argv[i], "--server-interface") == 0 && i + 1 < argc) {
+      num_server_path_interfaces = 0;
+      while (i + 1 < argc && argv[i + 1][0] != '-' &&
+             num_server_path_interfaces < 4)
+        server_path_interfaces[num_server_path_interfaces++] = argv[++i];
+    } else if (strcmp(argv[i], "--client-interface") == 0 && i + 1 < argc) {
+      num_client_path_interfaces = 0;
+      while (i + 1 < argc && argv[i + 1][0] != '-' &&
+             num_client_path_interfaces < 4)
+        client_path_interfaces[num_client_path_interfaces++] = argv[++i];
     } else if (strcmp(argv[i], "--client-remote") == 0 && i + 1 < argc) {
       client_remote_hosts[0] = argv[++i];
       num_client_remote = 1;
@@ -158,6 +181,9 @@ int main(int argc, char **argv) {
   server_cfg.num_bind_hosts = num_server_bind;
   for (int i = 0; i < num_server_bind; i++)
     server_cfg.bind_hosts[i] = server_bind_hosts[i];
+  server_cfg.num_path_interface_names = num_server_path_interfaces;
+  for (int i = 0; i < num_server_path_interfaces; i++)
+    server_cfg.path_interface_names[i] = server_path_interfaces[i];
 
   /* create client transport config */
   transport_config_t client_cfg = {.port = 9999,
@@ -169,6 +195,9 @@ int main(int argc, char **argv) {
   client_cfg.num_bind_hosts = num_client_bind;
   for (int i = 0; i < num_client_bind; i++)
     client_cfg.bind_hosts[i] = client_bind_hosts[i];
+  client_cfg.num_path_interface_names = num_client_path_interfaces;
+  for (int i = 0; i < num_client_path_interfaces; i++)
+    client_cfg.path_interface_names[i] = client_path_interfaces[i];
   client_cfg.num_remote_hosts = num_client_remote;
   for (int i = 0; i < num_client_remote; i++)
     client_cfg.remote_hosts[i] = client_remote_hosts[i];
@@ -239,6 +268,8 @@ int main(int argc, char **argv) {
 
   double start_benchmark = get_time_ms();
   double frame_interval = 16.666; /* 60 FPS */
+  int packets_sent = 0;
+  bool publish_failed = false;
 
   for (int f = 0; f < MAX_PACKETS; f++) {
     double publish_target = start_benchmark + f * frame_interval;
@@ -263,10 +294,17 @@ int main(int argc, char **argv) {
         .is_keyframe = (f % 30 == 0) /* keyframe every 30 packets */
     };
 
-    transport_publish(server, &obj);
+    if (!transport_publish(server, &obj)) {
+      fprintf(stderr, "publish failed at packet %d\n", f);
+      publish_failed = true;
+      break;
+    }
+    packets_sent++;
 
     transport_tick(server);
     transport_tick(client);
+    if (server_state.disconnected || client_state.disconnected)
+      break;
   }
 
   /* drain/wait for final packets to arrive */
@@ -284,7 +322,7 @@ int main(int argc, char **argv) {
   int freezes = 0;
   double last_recv_time = 0;
 
-  for (int f = 0; f < MAX_PACKETS; f++) {
+  for (int f = 0; f < packets_sent; f++) {
     if (client_state.packets[f].arrived) {
       double lat =
           client_state.packets[f].recv_time - client_state.packets[f].send_time;
@@ -308,7 +346,7 @@ int main(int argc, char **argv) {
 
   /* calculate jitter */
   double sum_sq_diff = 0;
-  for (int f = 0; f < MAX_PACKETS; f++) {
+  for (int f = 0; f < packets_sent; f++) {
     if (client_state.packets[f].arrived) {
       double lat =
           client_state.packets[f].recv_time - client_state.packets[f].send_time;
@@ -319,10 +357,12 @@ int main(int argc, char **argv) {
 
   printf("--- RESULTS ---\n");
   printf("mode: %s\n", use_reliable ? "reliable" : "fec");
-  printf("sent: %d\n", MAX_PACKETS);
+  printf("sent: %d\n", packets_sent);
   printf("received: %d\n", samples);
   printf("loss_pct: %.1f%%\n",
-         ((double)(MAX_PACKETS - samples) / MAX_PACKETS) * 100.0);
+         packets_sent > 0
+             ? ((double)(packets_sent - samples) / packets_sent) * 100.0
+             : 0.0);
   printf("mean_latency: %.3f ms\n", mean_latency);
   printf("max_latency: %.3f ms\n", max_latency);
   printf("jitter: %.3f ms\n", jitter);
@@ -353,7 +393,9 @@ int main(int argc, char **argv) {
   printf("==========================================\n");
 
   free(frame_payload);
+  bool failed = publish_failed || server_state.disconnected ||
+                client_state.disconnected || packets_sent != MAX_PACKETS;
   transport_destroy(client);
   transport_destroy(server);
-  return 0;
+  return failed ? 1 : 0;
 }

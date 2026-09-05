@@ -368,16 +368,101 @@ static void configure_socket_buffers(int fd) {
             strerror(errno));
 }
 
+#define QLINQ_PATH_OPEN_RETRY_MS 100U
+
+static bool path_endpoint_families_match(const transport_t *t,
+                                         size_t local_index,
+                                         size_t remote_index) {
+  return local_index < t->num_fds && remote_index < t->num_remote_addrs &&
+         t->local_addrs[local_index].ss_family ==
+             t->remote_addrs[remote_index].ss_family;
+}
+
+static bool path_interface_allowed(const transport_t *t, const char *name) {
+  if (t->num_path_interface_names == 0)
+    return true;
+  for (size_t i = 0; i < t->num_path_interface_names; i++) {
+    if (strcmp(t->path_interface_names[i], name) == 0)
+      return true;
+  }
+  return false;
+}
+
+static size_t select_remote_for_added_local(const transport_t *t,
+                                            size_t local_index) {
+  if (t->num_remote_addrs == 0)
+    return SIZE_MAX;
+  if (t->num_remote_addrs == 1)
+    return path_endpoint_families_match(t, local_index, 0) ? 0 : SIZE_MAX;
+
+  for (size_t remote_index = 0; remote_index < t->num_remote_addrs;
+       remote_index++) {
+    if (!path_endpoint_families_match(t, local_index, remote_index))
+      continue;
+    bool assigned = false;
+    for (size_t i = 0; i < t->num_fds; i++) {
+      if (i != local_index && t->local_remote_indices[i] == remote_index) {
+        assigned = true;
+        break;
+      }
+    }
+    if (!assigned)
+      return remote_index;
+  }
+  return SIZE_MAX;
+}
+
+static void try_open_pending_paths(transport_t *t, transport_conn_t *conn,
+                                   uint64_t now) {
+  if (!t || !conn || t->is_server || !conn->quic_ready)
+    return;
+
+  for (size_t local_index = 0; local_index < t->num_fds; local_index++) {
+    if (!t->path_open_pending[local_index] ||
+        now < t->path_open_retry_at[local_index])
+      continue;
+    size_t remote_index = t->local_remote_indices[local_index];
+    if (!path_endpoint_families_match(t, local_index, remote_index)) {
+      t->path_open_pending[local_index] = false;
+      continue;
+    }
+
+    struct sockaddr *local = (struct sockaddr *)&t->local_addrs[local_index];
+    struct sockaddr *remote = (struct sockaddr *)&t->remote_addrs[remote_index];
+    if (transport_path_find_by_addresses(conn->quic, local, remote) !=
+        SIZE_MAX) {
+      t->path_open_pending[local_index] = false;
+      continue;
+    }
+
+    quicly_error_t ret = quicly_open_path(conn->quic, remote, local);
+    if (ret == 0) {
+      t->path_open_pending[local_index] = false;
+    } else if (ret == QUICLY_ERROR_PACKET_IGNORED) {
+      /* The peer may not have supplied a path ID or CID yet. */
+      t->path_open_retry_at[local_index] = now + QLINQ_PATH_OPEN_RETRY_MS;
+    } else {
+      fprintf(stderr,
+              "transport: unable to open QUIC path for local slot "
+              "%zu: %" PRId64 "\n",
+              local_index, (int64_t)ret);
+      t->path_open_pending[local_index] = false;
+    }
+  }
+}
+
 transport_t *transport_create(const transport_config_t *config) {
   if (!config || !config->callback || config->port == 0 ||
       config->num_bind_hosts == 0 ||
       config->num_bind_hosts > TRANSPORT_MAX_PATHS ||
+      config->num_path_interface_names > TRANSPORT_MAX_PATHS ||
       config->num_remote_hosts > TRANSPORT_MAX_PATHS ||
       config->simulated_loss_rate > 100 ||
       (!config->verify_peer && !config->allow_insecure_peer)) {
     if (config && config->callback && config->port != 0 &&
         config->num_bind_hosts > 0 &&
         config->num_bind_hosts <= TRANSPORT_MAX_PATHS &&
+        config->num_path_interface_names <= TRANSPORT_MAX_PATHS &&
         config->num_remote_hosts <= TRANSPORT_MAX_PATHS &&
         config->simulated_loss_rate <= 100)
       fprintf(stderr,
@@ -387,6 +472,12 @@ transport_t *transport_create(const transport_config_t *config) {
   }
   for (size_t i = 0; i < config->num_bind_hosts; i++) {
     if (!config->bind_hosts[i])
+      return NULL;
+  }
+  for (size_t i = 0; i < config->num_path_interface_names; i++) {
+    if (!config->path_interface_names[i] ||
+        strlen(config->path_interface_names[i]) >=
+            sizeof(((transport_t *)0)->path_interface_names[0]))
       return NULL;
   }
   for (size_t i = 0; i < config->num_remote_hosts; i++) {
@@ -408,8 +499,10 @@ transport_t *transport_create(const transport_config_t *config) {
     return NULL;
   }
 
-  for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++)
+  for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++) {
     t->fds[i] = -1;
+    t->local_remote_indices[i] = SIZE_MAX;
+  }
   t->owner_thread = pthread_self();
   atomic_init(&t->cross_thread_violations, 0);
   t->limits = limits;
@@ -451,6 +544,10 @@ transport_t *transport_create(const transport_config_t *config) {
   t->user_data = config->user_data;
   t->is_server = (config->num_remote_hosts == 0);
   t->simulated_loss_rate = config->simulated_loss_rate;
+  t->num_path_interface_names = config->num_path_interface_names;
+  for (size_t i = 0; i < t->num_path_interface_names; i++)
+    copy_interface_name(t->path_interface_names[i],
+                        config->path_interface_names[i]);
 
   t->last_pathflow_update = ptls_get_time.cb(&ptls_get_time);
 
@@ -641,6 +738,26 @@ transport_t *transport_create(const transport_config_t *config) {
       }
     }
 
+    if (t->num_remote_addrs > 1 && t->num_fds > t->num_remote_addrs) {
+      fprintf(stderr,
+              "transport: multiple remote hosts require at least one remote "
+              "for each configured bind host\n");
+      transport_destroy(t);
+      return NULL;
+    }
+    for (size_t i = 0; i < t->num_fds; i++) {
+      size_t remote_index = t->num_remote_addrs == 1 ? 0 : i;
+      if (!path_endpoint_families_match(t, i, remote_index)) {
+        fprintf(stderr,
+                "transport: bind host %zu and remote host %zu use different "
+                "address families\n",
+                i, remote_index);
+        transport_destroy(t);
+        return NULL;
+      }
+      t->local_remote_indices[i] = remote_index;
+    }
+
     transport_conn_t *conn = calloc(1, sizeof(transport_conn_t));
     if (!conn) {
       transport_destroy(t);
@@ -669,6 +786,8 @@ transport_t *transport_create(const transport_config_t *config) {
 
     *quicly_get_data(conn->quic) = conn;
     t->client_conn = conn;
+    for (size_t i = 1; i < t->num_fds; i++)
+      t->path_open_pending[i] = true;
 
     if (quicly_open_stream(conn->quic, &conn->stream, 0) != 0 ||
         !conn->stream) {
@@ -917,6 +1036,8 @@ void transport_tick(transport_t *t) {
     ifmon_pipe_msg_t msg;
     while (read(t->ifmon_pipe[0], &msg, sizeof(msg)) == sizeof(msg)) {
       if (msg.is_added) {
+        if (!path_interface_allowed(t, msg.name))
+          continue;
         if (t->num_fds < TRANSPORT_MAX_PATHS) {
           /* Deduplicate: Check if this IP is already bound */
           int is_duplicate = 0;
@@ -942,18 +1063,6 @@ void transport_tick(transport_t *t) {
             continue;
           }
 
-          /* Check if the new IP address matches the client/server side of the
-           * initially bound IP address */
-          if (msg.addr.ss_family == AF_INET &&
-              t->local_addrs[0].ss_family == AF_INET) {
-            uint32_t bound_ip = ntohl(
-                ((struct sockaddr_in *)&t->local_addrs[0])->sin_addr.s_addr);
-            uint32_t new_ip =
-                ntohl(((struct sockaddr_in *)&msg.addr)->sin_addr.s_addr);
-            if ((bound_ip & 0xFF) != (new_ip & 0xFF)) {
-              continue;
-            }
-          }
           int fd = socket(msg.addr.ss_family, SOCK_DGRAM, 0);
           if (fd >= 0) {
             int reuse = 1;
@@ -997,12 +1106,33 @@ void transport_tick(transport_t *t) {
                 continue;
               }
 
-              t->fds[t->num_fds] = fd;
-              t->local_addrs[t->num_fds] = msg.addr;
-              t->local_addrs_len[t->num_fds] = msg.addr_len;
-              t->local_ifindices[t->num_fds] = msg.index;
-              copy_interface_name(t->local_ifnames[t->num_fds], msg.name);
+              size_t local_index = t->num_fds;
+              t->fds[local_index] = fd;
+              t->local_addrs[local_index] = msg.addr;
+              t->local_addrs_len[local_index] = msg.addr_len;
+              t->local_ifindices[local_index] = msg.index;
+              copy_interface_name(t->local_ifnames[local_index], msg.name);
               t->num_fds++;
+
+              if (!t->is_server) {
+                size_t remote_index =
+                    select_remote_for_added_local(t, local_index);
+                if (remote_index == SIZE_MAX) {
+                  transport_egress_destroy(&t->egress[local_index]);
+                  CLOSE_SOCKET(t->fds[local_index]);
+                  t->fds[local_index] = -1;
+                  memset(&t->local_addrs[local_index], 0,
+                         sizeof(t->local_addrs[local_index]));
+                  t->local_addrs_len[local_index] = 0;
+                  t->local_ifindices[local_index] = 0;
+                  memset(t->local_ifnames[local_index], 0,
+                         sizeof(t->local_ifnames[local_index]));
+                  t->num_fds--;
+                  continue;
+                }
+                t->local_remote_indices[local_index] = remote_index;
+                t->path_open_pending[local_index] = true;
+              }
 
               char ip_str[64];
               if (msg.addr.ss_family == AF_INET) {
@@ -1016,26 +1146,6 @@ void transport_tick(transport_t *t) {
               fprintf(stderr, "ifmon: opened new socket for local IP %s\n",
                       ip_str);
 
-              if (!t->is_server && t->client_conn) {
-                for (size_t r = 0; r < t->num_remote_addrs; r++) {
-                  /* Only open path if the local and remote addresses are on the
-                   * same /24 subnet */
-                  if (t->remote_addrs[r].ss_family == AF_INET &&
-                      msg.addr.ss_family == AF_INET) {
-                    uint32_t remote_ip =
-                        ntohl(((struct sockaddr_in *)&t->remote_addrs[r])
-                                  ->sin_addr.s_addr);
-                    uint32_t local_ip = ntohl(
-                        ((struct sockaddr_in *)&msg.addr)->sin_addr.s_addr);
-                    if ((remote_ip & 0xFFFFFF00) != (local_ip & 0xFFFFFF00)) {
-                      continue;
-                    }
-                  }
-                  quicly_open_path(t->client_conn->quic,
-                                   (struct sockaddr *)&t->remote_addrs[r],
-                                   (struct sockaddr *)&msg.addr);
-                }
-              }
             } else {
               CLOSE_SOCKET(fd);
             }
@@ -1076,12 +1186,18 @@ void transport_tick(transport_t *t) {
                      sizeof(t->local_ifnames[j]));
               t->udp_bytes_received[j] = t->udp_bytes_received[j + 1];
               t->egress[j] = t->egress[j + 1];
+              t->local_remote_indices[j] = t->local_remote_indices[j + 1];
+              t->path_open_pending[j] = t->path_open_pending[j + 1];
+              t->path_open_retry_at[j] = t->path_open_retry_at[j + 1];
             }
             t->num_fds--;
             memset(t->local_ifnames[t->num_fds], 0,
                    sizeof(t->local_ifnames[t->num_fds]));
             t->udp_bytes_received[t->num_fds] = 0;
             memset(&t->egress[t->num_fds], 0, sizeof(t->egress[t->num_fds]));
+            t->local_remote_indices[t->num_fds] = SIZE_MAX;
+            t->path_open_pending[t->num_fds] = false;
+            t->path_open_retry_at[t->num_fds] = 0;
             fprintf(stderr, "ifmon: removed socket for local IP\n");
             break;
           }
@@ -1223,7 +1339,8 @@ void transport_tick(transport_t *t) {
 
           size_t path_idx = transport_path_find_by_link(
               target->quic, t->local_addrs, t->num_fds, i);
-          if (quicly_get_path_stats(target->quic, path_idx, &path_stats) == 0) {
+          if (path_idx < TRANSPORT_MAX_QUIC_PATHS &&
+              quicly_get_path_stats(target->quic, path_idx, &path_stats) == 0) {
             if (path_stats.rtt_smoothed > 0) {
               path_l = FP_DIV(FP_FROM_INT(path_stats.rtt_smoothed),
                               FP_FROM_INT(2000));
@@ -1254,6 +1371,7 @@ void transport_tick(transport_t *t) {
     if (!conn->quic_ready && quicly_connection_is_ready(conn->quic)) {
       conn->quic_ready = true;
     }
+    try_open_pending_paths(t, conn, now);
     if (conn->quic_ready)
       (void)transport_protocol_send_hello(conn);
     transport_protocol_maybe_emit_connected(conn);
@@ -1287,7 +1405,7 @@ void transport_tick(transport_t *t) {
         if (sent_path < TRANSPORT_MAX_QUIC_PATHS)
           conn->queued_datagrams[sent_path] = 0;
 
-        size_t out_fd_index = 0;
+        size_t out_fd_index = SIZE_MAX;
         if (src.sa.sa_family == AF_INET) {
           struct sockaddr_in *src_in = (struct sockaddr_in *)&src.sa;
           for (size_t k = 0; k < t->num_fds; k++) {
@@ -1313,6 +1431,13 @@ void transport_tick(transport_t *t) {
               }
             }
           }
+        }
+
+        if (out_fd_index == SIZE_MAX) {
+          t->stats.udp_send_errors += num_dgrams;
+          fprintf(stderr,
+                  "transport: no UDP socket matches QUIC source address\n");
+          continue;
         }
 
         if (!transport_egress_submit(
@@ -1623,6 +1748,13 @@ bool transport_get_conn_stats(transport_t *t, transport_conn_t *conn,
   stats->stream_frames_received = conn->stream_frames_received;
   stats->datagrams_received = conn->datagrams_received;
   stats->malformed_datagrams = conn->malformed_datagrams;
+  quicly_stats_t quic_stats;
+  if (quicly_get_stats(conn->quic, &quic_stats) == 0) {
+    stats->quic_paths_created = quic_stats.num_paths.created;
+    stats->quic_paths_validated = quic_stats.num_paths.validated;
+    stats->quic_paths_validation_failed =
+        quic_stats.num_paths.validation_failed;
+  }
   return true;
 }
 
@@ -1702,8 +1834,9 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
     quicly_path_stats_t path_stats;
     size_t mapped_path_idx = transport_path_find_by_link(
         target->quic, t->local_addrs, t->num_fds, path_idx);
-    if (quicly_get_path_stats(target->quic, mapped_path_idx, &path_stats) ==
-        0) {
+    if (mapped_path_idx < TRANSPORT_MAX_QUIC_PATHS &&
+        quicly_get_path_stats(target->quic, mapped_path_idx, &path_stats) ==
+            0) {
       stats->sent = path_stats.sent;
       stats->lost = path_stats.lost;
       stats->rtt = path_stats.rtt_smoothed;
