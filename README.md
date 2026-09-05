@@ -45,8 +45,9 @@ Receive it with:
 
 The app also supports reliable, plain datagram, fixed-FEC, and rateless modes,
 IPv6 bracketed peer endpoints, negotiated repair selection, an explicit QUIC
-idle timeout, and machine-readable counter snapshots. Run `qlinq-app --help`
-for the complete interface.
+idle timeout, machine-readable counter snapshots, and `--pv` for pv-style wire
+throughput per physical interface. Run `qlinq-app --help` for the complete
+interface.
 
 ## Security
 

@@ -83,6 +83,8 @@ struct transport_t {
   struct sockaddr_storage local_addrs[TRANSPORT_MAX_PATHS];
   socklen_t local_addrs_len[TRANSPORT_MAX_PATHS];
   uint32_t local_ifindices[TRANSPORT_MAX_PATHS];
+  char local_ifnames[TRANSPORT_MAX_PATHS][64];
+  uint64_t udp_bytes_received[TRANSPORT_MAX_PATHS];
   transport_egress_t egress[TRANSPORT_MAX_PATHS];
   transport_limits_t limits;
   transport_stats_t stats;

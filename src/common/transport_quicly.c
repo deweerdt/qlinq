@@ -143,10 +143,53 @@ bool transport_queue_datagram(transport_conn_t *conn, size_t path_index,
 
 typedef struct {
   uint32_t index;
+  char name[64];
   struct sockaddr_storage addr;
   socklen_t addr_len;
   int is_added;
 } ifmon_pipe_msg_t;
+
+static void copy_interface_name(char destination[64], const char *name) {
+  if (!destination || !name)
+    return;
+  strncpy(destination, name, 63);
+  destination[63] = '\0';
+}
+
+static bool ifmon_address_matches(const ifmon_addr_t *address,
+                                  const struct sockaddr_storage *local) {
+  if (!address || !local || address->family != local->ss_family)
+    return false;
+  if (address->family == AF_INET)
+    return address->ip.v4.s_addr ==
+           ((const struct sockaddr_in *)local)->sin_addr.s_addr;
+  if (address->family == AF_INET6)
+    return memcmp(&address->ip.v6,
+                  &((const struct sockaddr_in6 *)local)->sin6_addr,
+                  sizeof(address->ip.v6)) == 0;
+  return false;
+}
+
+static void resolve_configured_interfaces(transport_t *t) {
+  ifmon_list_t interfaces = {0};
+  uint8_t scratchpad[IFMON_SCRATCHPAD_SIZE];
+  if (!t || ifmon_list_get(&interfaces, scratchpad, sizeof(scratchpad)) != 0)
+    return;
+  for (size_t path = 0; path < t->num_fds; path++) {
+    for (int i = 0; i < interfaces.count; i++) {
+      const ifmon_iface_t *iface = &interfaces.ifaces[i];
+      for (int a = 0; a < iface->addr_count; a++) {
+        if (!ifmon_address_matches(&iface->addrs[a], &t->local_addrs[path]))
+          continue;
+        t->local_ifindices[path] = iface->index;
+        copy_interface_name(t->local_ifnames[path], iface->name);
+        break;
+      }
+      if (t->local_ifindices[path] != 0)
+        break;
+    }
+  }
+}
 
 static void bind_to_device(int fd, uint32_t index) {
   if (index == 0)
@@ -194,6 +237,7 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
           const ifmon_addr_t *a = &iface->addrs[k];
           ifmon_pipe_msg_t msg = {0};
           msg.index = idx;
+          copy_interface_name(msg.name, iface->name);
           msg.is_added = 1;
           if (a->family == AF_INET) {
             struct sockaddr_in *sin = (struct sockaddr_in *)&msg.addr;
@@ -234,6 +278,7 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
             const ifmon_addr_t *a = &iface->addrs[a_idx];
             ifmon_pipe_msg_t msg = {0};
             msg.index = diff->index;
+            copy_interface_name(msg.name, iface->name);
             msg.is_added = diff->is_up ? 1 : 0;
             if (a->family == AF_INET) {
               struct sockaddr_in *sin = (struct sockaddr_in *)&msg.addr;
@@ -259,6 +304,12 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
       ifmon_pipe_msg_t msg = {0};
       msg.index = diff->index;
       msg.is_added = 1;
+      for (int k = 0; k < update->interfaces->count; k++) {
+        if (update->interfaces->ifaces[k].index == diff->index) {
+          copy_interface_name(msg.name, update->interfaces->ifaces[k].name);
+          break;
+        }
+      }
       if (a->family == AF_INET) {
         struct sockaddr_in *sin = (struct sockaddr_in *)&msg.addr;
         sin->sin_family = AF_INET;
@@ -279,6 +330,12 @@ static void on_ifmon_update(const ifmon_update_t *update, void *userdata) {
       ifmon_pipe_msg_t msg = {0};
       msg.index = diff->index;
       msg.is_added = 0;
+      for (int k = 0; k < update->interfaces->count; k++) {
+        if (update->interfaces->ifaces[k].index == diff->index) {
+          copy_interface_name(msg.name, update->interfaces->ifaces[k].name);
+          break;
+        }
+      }
       if (a->family == AF_INET) {
         struct sockaddr_in *sin = (struct sockaddr_in *)&msg.addr;
         sin->sin_family = AF_INET;
@@ -509,6 +566,7 @@ transport_t *transport_create(const transport_config_t *config) {
       return NULL;
     }
   }
+  resolve_configured_interfaces(t);
 
   if (t->is_server || (config->cert_file && config->key_file)) {
     if (transport_tls_load_certificate_and_key(&t->tls_ctx, &t->sign_cert,
@@ -943,6 +1001,7 @@ void transport_tick(transport_t *t) {
               t->local_addrs[t->num_fds] = msg.addr;
               t->local_addrs_len[t->num_fds] = msg.addr_len;
               t->local_ifindices[t->num_fds] = msg.index;
+              copy_interface_name(t->local_ifnames[t->num_fds], msg.name);
               t->num_fds++;
 
               char ip_str[64];
@@ -1013,9 +1072,15 @@ void transport_tick(transport_t *t) {
               t->local_addrs[j] = t->local_addrs[j + 1];
               t->local_addrs_len[j] = t->local_addrs_len[j + 1];
               t->local_ifindices[j] = t->local_ifindices[j + 1];
+              memcpy(t->local_ifnames[j], t->local_ifnames[j + 1],
+                     sizeof(t->local_ifnames[j]));
+              t->udp_bytes_received[j] = t->udp_bytes_received[j + 1];
               t->egress[j] = t->egress[j + 1];
             }
             t->num_fds--;
+            memset(t->local_ifnames[t->num_fds], 0,
+                   sizeof(t->local_ifnames[t->num_fds]));
+            t->udp_bytes_received[t->num_fds] = 0;
             memset(&t->egress[t->num_fds], 0, sizeof(t->egress[t->num_fds]));
             fprintf(stderr, "ifmon: removed socket for local IP\n");
             break;
@@ -1040,6 +1105,7 @@ void transport_tick(transport_t *t) {
         continue;
       }
       receive_budget--;
+      t->udp_bytes_received[fd_idx] += (uint64_t)rret;
 
       struct sockaddr *psa = (struct sockaddr *)&sa;
 
@@ -1613,6 +1679,22 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
     return false;
 
   memset(stats, 0, sizeof(*stats));
+  stats->interface_index = t->local_ifindices[path_idx];
+  copy_interface_name(stats->interface_name, t->local_ifnames[path_idx]);
+  const void *address = NULL;
+  if (t->local_addrs[path_idx].ss_family == AF_INET)
+    address =
+        &((const struct sockaddr_in *)&t->local_addrs[path_idx])->sin_addr;
+  else if (t->local_addrs[path_idx].ss_family == AF_INET6)
+    address =
+        &((const struct sockaddr_in6 *)&t->local_addrs[path_idx])->sin6_addr;
+  if (address)
+    (void)inet_ntop(t->local_addrs[path_idx].ss_family, address,
+                    stats->local_address, sizeof(stats->local_address));
+  if (!stats->interface_name[0])
+    copy_interface_name(stats->interface_name, stats->local_address);
+  stats->bytes_sent = t->egress[path_idx].bytes_sent;
+  stats->bytes_received = t->udp_bytes_received[path_idx];
 
   transport_conn_t *target =
       t->is_server ? (t->conn_count > 0 ? t->conns[0] : NULL) : t->client_conn;

@@ -20,6 +20,7 @@
 
 #define APP_REORDER_OBJECTS 256U
 #define APP_REORDER_MAX_BYTES (64U * 1024U * 1024U)
+#define APP_PV_INTERVAL_MS 1000U
 
 typedef struct {
   uint8_t *data;
@@ -27,6 +28,14 @@ typedef struct {
   uint64_t object_id;
   bool active;
 } reorder_entry_t;
+
+typedef struct {
+  uint32_t interface_index;
+  char local_address[64];
+  uint64_t bytes_sent;
+  uint64_t bytes_received;
+  bool initialized;
+} pv_path_t;
 
 typedef struct {
   transport_t *transport;
@@ -56,10 +65,13 @@ typedef struct {
   int64_t finished_at;
   int64_t received_at;
   int64_t started_at;
+  int64_t pv_last_at;
+  int64_t next_pv_at;
   bool is_server;
   bool input_eof;
   bool track_finished;
   bool one_shot;
+  bool pv;
   bool verbose;
   bool failed;
   bool reorder_initialized;
@@ -67,6 +79,7 @@ typedef struct {
   uint64_t reorder_next_object_id;
   size_t reorder_bytes;
   reorder_entry_t reorder[APP_REORDER_OBJECTS];
+  pv_path_t pv_paths[TRANSPORT_MAX_PATHS];
 } app_t;
 
 static volatile sig_atomic_t running = 1;
@@ -105,6 +118,7 @@ static void show_help(FILE *out, const char *program) {
           "  --drain-ms MS               default 1000\n"
           "  --stats-ms MS               periodically print counters\n"
           "  --stats-file FILE           write TSV counter snapshots\n"
+          "  --pv                        pv-style throughput per interface\n"
           "  --node-id ID                TSV node label\n"
           "  --verbose\n",
           program);
@@ -391,6 +405,79 @@ static void print_stats(app_t *app, int64_t now, bool force) {
   app->next_stats_at = now + app->stats_ms;
 }
 
+static void format_bytes(double bytes, char *output, size_t capacity) {
+  static const char *const units[] = {"B", "KiB", "MiB", "GiB", "TiB"};
+  size_t unit = 0;
+  while (bytes >= 1024.0 && unit + 1 < sizeof(units) / sizeof(units[0])) {
+    bytes /= 1024.0;
+    unit++;
+  }
+  if (unit == 0)
+    snprintf(output, capacity, "%.0f %s", bytes, units[unit]);
+  else
+    snprintf(output, capacity, "%.2f %s", bytes, units[unit]);
+}
+
+static void print_pv(app_t *app, int64_t now, bool force) {
+  if (!app->pv || (!force && now < app->next_pv_at))
+    return;
+  int64_t interval_ms = now - app->pv_last_at;
+  if (interval_ms <= 0)
+    interval_ms = 1;
+  uint64_t elapsed_seconds =
+      now > app->started_at ? (uint64_t)(now - app->started_at) / 1000U : 0;
+
+  for (size_t path = 0; path < TRANSPORT_MAX_PATHS; path++) {
+    transport_path_stats_t stats;
+    if (!transport_get_path_stats(app->transport, path, &stats))
+      break;
+    pv_path_t *previous = &app->pv_paths[path];
+    bool same_path = previous->initialized &&
+                     previous->interface_index == stats.interface_index &&
+                     strcmp(previous->local_address, stats.local_address) == 0;
+    uint64_t sent_delta = same_path && stats.bytes_sent >= previous->bytes_sent
+                              ? stats.bytes_sent - previous->bytes_sent
+                              : stats.bytes_sent;
+    uint64_t received_delta =
+        same_path && stats.bytes_received >= previous->bytes_received
+            ? stats.bytes_received - previous->bytes_received
+            : stats.bytes_received;
+    double sent_rate = (double)sent_delta * 1000.0 / (double)interval_ms;
+    double received_rate =
+        (double)received_delta * 1000.0 / (double)interval_ms;
+
+    char sent_total[32], received_total[32], sent_per_second[32];
+    char received_per_second[32], label[136];
+    format_bytes((double)stats.bytes_sent, sent_total, sizeof(sent_total));
+    format_bytes((double)stats.bytes_received, received_total,
+                 sizeof(received_total));
+    format_bytes(sent_rate, sent_per_second, sizeof(sent_per_second));
+    format_bytes(received_rate, received_per_second,
+                 sizeof(received_per_second));
+    if (stats.local_address[0] &&
+        strcmp(stats.interface_name, stats.local_address) != 0)
+      snprintf(label, sizeof(label), "%s (%s)", stats.interface_name,
+               stats.local_address);
+    else
+      snprintf(label, sizeof(label), "%s", stats.interface_name);
+    fprintf(stderr,
+            "qlinq-app: pv %s tx %s %" PRIu64 ":%02" PRIu64 ":%02" PRIu64
+            " [%s/s] rx %s [%s/s]\n",
+            label, sent_total, elapsed_seconds / 3600U,
+            (elapsed_seconds / 60U) % 60U, elapsed_seconds % 60U,
+            sent_per_second, received_total, received_per_second);
+
+    previous->interface_index = stats.interface_index;
+    memcpy(previous->local_address, stats.local_address,
+           sizeof(previous->local_address));
+    previous->bytes_sent = stats.bytes_sent;
+    previous->bytes_received = stats.bytes_received;
+    previous->initialized = true;
+  }
+  app->pv_last_at = now;
+  app->next_pv_at = now + APP_PV_INTERVAL_MS;
+}
+
 static void cleanup_reorder(app_t *app) {
   for (size_t i = 0; i < APP_REORDER_OBJECTS; i++)
     free(app->reorder[i].data);
@@ -556,6 +643,8 @@ int main(int argc, char **argv) {
     } else if (strcmp(argv[i], "--stats-file") == 0) {
       REQUIRE_VALUE();
       stats_path = argv[i];
+    } else if (strcmp(argv[i], "--pv") == 0) {
+      app.pv = true;
     } else if (strcmp(argv[i], "--node-id") == 0) {
       REQUIRE_VALUE();
       if (!argv[i][0] || strchr(argv[i], '\t') || strchr(argv[i], '\n'))
@@ -669,12 +758,15 @@ int main(int argc, char **argv) {
 
   app.started_at = transport_get_time_ms();
   app.next_stats_at = app.started_at + app.stats_ms;
+  app.pv_last_at = app.started_at;
+  app.next_pv_at = app.started_at + APP_PV_INTERVAL_MS;
   while (running && !app.failed) {
     int64_t now = transport_get_time_ms();
     transport_tick(app.transport);
     publish_pending(&app, now);
     finish_track(&app, now);
     print_stats(&app, now, false);
+    print_pv(&app, now, false);
 
     bool send_done = !app.one_shot || (app.track_finished &&
                                        now - app.finished_at >= app.drain_ms);
@@ -706,7 +798,9 @@ int main(int argc, char **argv) {
                        (fds[input_index].revents & (POLLIN | POLLHUP)) != 0;
     load_input(&app, input_ready);
   }
-  print_stats(&app, transport_get_time_ms(), true);
+  int64_t stopped_at = transport_get_time_ms();
+  print_stats(&app, stopped_at, true);
+  print_pv(&app, stopped_at, true);
 
 cleanup_sockets:
   if (app.transport)

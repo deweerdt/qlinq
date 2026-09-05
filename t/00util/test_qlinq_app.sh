@@ -22,7 +22,7 @@ timeout 8 "$app_bin" \
     --auth-token app-test --insecure-no-verify \
     --input README.md --message-size 512 --count 1 \
     --wait-subscribers 1 --one-shot --drain-ms 500 --mode rateless \
-    --node-id direct-source --stats-file "$tmp_dir/server.tsv" \
+    --node-id direct-source --stats-file "$tmp_dir/server.tsv" --pv \
     2>"$tmp_dir/server.log" &
 server_pid=$!
 
@@ -32,7 +32,7 @@ timeout 4 "$app_bin" \
     --auth-token app-test --insecure-no-verify \
     --output "$tmp_dir/output.bin" --mode rateless \
     --receive-count 1 --drain-ms 200 \
-    --node-id direct-rx --stats-file "$tmp_dir/client.tsv" \
+    --node-id direct-rx --stats-file "$tmp_dir/client.tsv" --pv \
     2>"$tmp_dir/client.log" &
 client_pid=$!
 
@@ -62,6 +62,10 @@ awk -F '\t' '$2 == "direct-source" && $6 >= 1 { ok=1 } END { exit !ok }' \
     "$tmp_dir/server.tsv"
 awk -F '\t' '$2 == "direct-rx" && $7 >= 1 { ok=1 } END { exit !ok }' \
     "$tmp_dir/client.tsv"
+grep -Eq 'qlinq-app: pv .+ tx .+ \[[^]]+/s\] rx .+ \[[^]]+/s\]' \
+    "$tmp_dir/server.log"
+grep -Eq 'qlinq-app: pv .+ tx .+ \[[^]]+/s\] rx .+ \[[^]]+/s\]' \
+    "$tmp_dir/client.log"
 
 # Two clients exercise per-connection subscription targeting and distinct
 # server-issued connection IDs.

@@ -237,6 +237,11 @@ void transport_close_conn(transport_t *t, transport_conn_t *conn);
 uint64_t transport_get_estimated_bandwidth(transport_t *t);
 
 typedef struct {
+  uint32_t interface_index;
+  char interface_name[64];
+  char local_address[64];
+  uint64_t bytes_sent;
+  uint64_t bytes_received;
   uint64_t sent;
   uint64_t lost;
   uint32_t rtt;
@@ -323,6 +328,8 @@ transport_repair_mode_t
 transport_get_effective_repair_mode(transport_t *t, transport_conn_t *conn,
                                     const moq_track_id_t *track_id);
 
+/* Snapshot the physical interface corresponding to a Pathflow input slot.
+ * Returns false when path_idx is not currently active. */
 bool transport_get_path_stats(transport_t *t, size_t path_idx,
                               transport_path_stats_t *stats);
 
