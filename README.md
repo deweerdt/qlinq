@@ -32,6 +32,7 @@ For example, send one 512-byte rateless-protected record:
 
 ```bash
 ./qlinq-app --listen 8888 --bind 127.0.0.1 \
+  --cert t/assets/server.crt --key t/assets/server.key \
   --auth-token test --insecure-no-verify --input payload.bin \
   --message-size 512 --count 1 --wait-subscribers 1 --one-shot
 ```

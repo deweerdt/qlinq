@@ -83,8 +83,15 @@ typedef struct {
 } app_t;
 
 static volatile sig_atomic_t running = 1;
+static volatile sig_atomic_t reload_credentials_requested = 0;
 
 static void handle_signal(int sig) {
+#ifdef SIGHUP
+  if (sig == SIGHUP) {
+    reload_credentials_requested = 1;
+    return;
+  }
+#endif
   (void)sig;
   running = 0;
 }
@@ -94,7 +101,8 @@ static void show_help(FILE *out, const char *program) {
           "usage: %s (--listen PORT | --peer HOST[:PORT]) [options]\n\n"
           "Network:\n"
           "  --bind ADDRESS              numeric local address\n"
-          "  --cert FILE --key FILE      local TLS identity\n"
+          "  --cert FILE --key FILE      TLS identity; required for listeners "
+          "and verified peers\n"
           "  --ca FILE                   peer CA bundle\n"
           "  --auth-token TOKEN          application authentication token\n"
           "  --insecure-no-verify        test-only certificate bypass\n"
@@ -102,7 +110,7 @@ static void show_help(FILE *out, const char *program) {
           "  --max-connections N         listener connection capacity\n"
           "  --max-repair-requests N     per-peer repair requests/second\n"
           "  --max-aggregate-repairs N   source-wide repair requests/second\n"
-          "  --loss PERCENT              simulated inbound packet loss\n\n"
+          "  --loss PERCENT              test-only simulated packet loss\n\n"
           "Data:\n"
           "  --track NAME                default qlinq-app/data\n"
           "  --mode datagram|fec|rateless|reliable\n"
@@ -120,7 +128,9 @@ static void show_help(FILE *out, const char *program) {
           "  --stats-file FILE           write TSV counter snapshots\n"
           "  --pv                        pv-style throughput per interface\n"
           "  --node-id ID                TSV node label\n"
-          "  --verbose\n",
+          "  --verbose\n\n"
+          "Signals:\n"
+          "  SIGHUP                      reload --cert and --key atomically\n",
           program);
 }
 
@@ -312,7 +322,17 @@ static void on_event(void *user_data, const transport_event_t *event) {
     break;
   case TRANSPORT_EVENT_DISCONNECTED:
     if (app->verbose)
-      fprintf(stderr, "qlinq-app: peer disconnected\n");
+      fprintf(stderr,
+              "qlinq-app: peer disconnected origin=%s class=%s code=%" PRIu64
+              " raw=%" PRId64 " reason=%s\n",
+              event->disconnect.remote ? "remote" : "local",
+              event->disconnect.application_error ? "application"
+              : event->disconnect.raw_error >= 0  ? "transport"
+                                                  : "internal",
+              event->disconnect.error_code, event->disconnect.raw_error,
+              event->disconnect.reason && event->disconnect.reason[0]
+                  ? event->disconnect.reason
+                  : "none");
     break;
   case TRANSPORT_EVENT_OBJECT_LOST:
     if (app->verbose)
@@ -389,11 +409,25 @@ static void print_stats(app_t *app, int64_t now, bool force) {
   if (app->stats_output) {
     fprintf(app->stats_output,
             "%" PRId64 "\t%s\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
+            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%zu"
+            "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64
+            "\t%" PRIu64 "\t%" PRIu64 "\t%zu\t%" PRIu64 "\t%zu\t%zu\t%zu\t%zu"
             "\t%" PRIu64 "\t%" PRIu64 "\t%" PRIu64 "\n",
             now - app->started_at, app->node_id, app->sent_records,
             app->received_records, app->received_bytes, stats.track_ends_sent,
             stats.track_ends_received, stats.recovery_checkpoints_sent,
-            stats.recovery_checkpoints_received);
+            stats.recovery_checkpoints_received, stats.active_connections,
+            stats.reconnect_attempts, stats.reconnect_succeeded,
+            stats.reconnect_failed, stats.repair_requests_sent,
+            stats.repair_requests_received, stats.repair_requests_deferred,
+            stats.repair_requests_throttled +
+                stats.repair_requests_aggregate_throttled,
+            stats.recovery_checkpoints_pending,
+            stats.recovery_oldest_checkpoint_age_ms,
+            stats.egress_current_packets, stats.egress_current_bytes,
+            stats.egress_peak_packets, stats.egress_peak_bytes,
+            stats.udp_would_block, stats.publish_backpressure,
+            stats.publish_errors);
     fflush(app->stats_output);
   } else {
     fprintf(stderr,
@@ -491,8 +525,8 @@ int main(int argc, char **argv) {
                .node_id = "qlinq-app"};
   const char *bind_host = NULL;
   const char *peer_arg = NULL;
-  const char *cert_file = "t/assets/server.crt";
-  const char *key_file = "t/assets/server.key";
+  const char *cert_file = NULL;
+  const char *key_file = NULL;
   const char *ca_file = NULL;
   const char *input_path = NULL;
   const char *output_path = NULL;
@@ -658,6 +692,13 @@ int main(int argc, char **argv) {
   }
 #undef REQUIRE_VALUE
 
+  if ((cert_file == NULL) != (key_file == NULL) ||
+      ((listen_port != 0 || verify_peer) && cert_file == NULL)) {
+    fprintf(stderr,
+            "qlinq-app: a TLS identity is required; use both --cert and "
+            "--key (insecure clients may omit both)\n");
+    return 1;
+  }
   if ((listen_port == 0) == (peer_arg == NULL) ||
       (!input_path && !output_path) || (app.one_shot && !input_path) ||
       !app.auth_token || !app.auth_token[0])
@@ -700,7 +741,13 @@ int main(int argc, char **argv) {
     fprintf(app.stats_output,
             "elapsed_ms\tnode\ttx_records\trx_records\trx_bytes\t"
             "track_ends_sent\ttrack_ends_received\tcheckpoints_sent\t"
-            "checkpoints_received\n");
+            "checkpoints_received\tactive_connections\treconnect_attempts\t"
+            "reconnect_succeeded\treconnect_failed\trepair_requests_sent\t"
+            "repair_requests_received\trepair_requests_deferred\t"
+            "repair_requests_throttled\trecovery_checkpoints_pending\t"
+            "recovery_oldest_checkpoint_age_ms\tegress_current_packets\t"
+            "egress_current_bytes\tegress_peak_packets\tegress_peak_bytes\t"
+            "udp_would_block\tpublish_backpressure\tpublish_errors\n");
   }
   app.message = malloc(message_size);
   if (!app.message) {
@@ -715,6 +762,9 @@ int main(int argc, char **argv) {
   }
   signal(SIGINT, handle_signal);
   signal(SIGTERM, handle_signal);
+#ifdef SIGHUP
+  signal(SIGHUP, handle_signal);
+#endif
 
   char peer_host[256] = {0};
   uint16_t port = listen_port;
@@ -744,6 +794,7 @@ int main(int argc, char **argv) {
   config.callback = on_event;
   config.user_data = &app;
   config.simulated_loss_rate = simulated_loss;
+  config.reconnect_enabled = peer_arg != NULL;
   config.repair_mode = repair_mode;
   config.limits.max_connections = max_connections;
   config.limits.max_repair_requests_per_second = max_repair_requests;
@@ -762,6 +813,20 @@ int main(int argc, char **argv) {
   app.next_pv_at = app.started_at + APP_PV_INTERVAL_MS;
   while (running && !app.failed) {
     int64_t now = transport_get_time_ms();
+#ifdef SIGHUP
+    if (reload_credentials_requested) {
+      reload_credentials_requested = 0;
+      if (!cert_file) {
+        fprintf(stderr, "qlinq-app: TLS credential reload skipped; no identity "
+                        "configured\n");
+      } else if (!transport_reload_credentials(app.transport, cert_file,
+                                               key_file)) {
+        fprintf(stderr, "qlinq-app: TLS credential reload failed\n");
+      } else {
+        fprintf(stderr, "qlinq-app: TLS credentials reloaded\n");
+      }
+    }
+#endif
     transport_tick(app.transport);
     publish_pending(&app, now);
     finish_track(&app, now);
@@ -797,6 +862,14 @@ int main(int argc, char **argv) {
     bool input_ready = input_index != SIZE_MAX && polled > 0 &&
                        (fds[input_index].revents & (POLLIN | POLLHUP)) != 0;
     load_input(&app, input_ready);
+  }
+  int64_t shutdown_started = transport_get_time_ms();
+  transport_shutdown(app.transport,
+                     running ? "application complete" : "signal shutdown");
+  while (!transport_is_drained(app.transport) &&
+         transport_get_time_ms() - shutdown_started < app.drain_ms) {
+    transport_tick(app.transport);
+    usleep(1000);
   }
   int64_t stopped_at = transport_get_time_ms();
   print_stats(&app, stopped_at, true);

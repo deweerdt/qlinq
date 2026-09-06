@@ -3,6 +3,9 @@
 #include <openssl/pem.h>
 #include <stdint.h>
 #include <stdio.h>
+#ifndef _WIN32
+#include <sys/stat.h>
+#endif
 
 static const uint16_t insecure_verify_algorithms[] = {
     PTLS_SIGNATURE_ECDSA_SECP256R1_SHA256, PTLS_SIGNATURE_RSA_PSS_RSAE_SHA256,
@@ -30,6 +33,19 @@ int transport_tls_load_certificate_and_key(
     fprintf(stderr, "certificate file and key file are required\n");
     return -1;
   }
+#ifndef _WIN32
+  struct stat key_stat;
+  if (stat(key_file, &key_stat) != 0) {
+    fprintf(stderr, "failed to inspect private key file\n");
+    return -1;
+  }
+  if ((key_stat.st_mode & (S_IWGRP | S_IXGRP | S_IRWXO)) != 0) {
+    fprintf(stderr,
+            "private key permissions are unsafe; remove group write/execute "
+            "and all access for other users\n");
+    return -1;
+  }
+#endif
   if (ptls_load_certificates(tls, (char *)certificate_file) != 0) {
     fprintf(stderr, "failed to load certificates\n");
     return -1;

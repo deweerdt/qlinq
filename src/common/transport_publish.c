@@ -12,9 +12,11 @@
 #include "quicly/sendstate.h"
 
 #include <inttypes.h>
-#include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
+
+static transport_publish_result_t
+transport_publish_impl(transport_t *t, const moq_object_t *obj);
 
 static transport_publish_result_t publish_datagram_to_conn(
     transport_t *t, transport_conn_t *conn, const moq_object_t *obj,
@@ -38,10 +40,10 @@ static transport_publish_result_t publish_datagram_to_conn(
 
   transport_schedule_t schedule;
   bool use_fec = profile->fec_enabled || profile->fec_rateless;
-  if (!transport_schedule_build(&t->scheduler_context, conn->quic,
+  if (!transport_schedule_build(&conn->scheduler_context, conn->quic,
                                 active_states, active_paths, data_symbols,
                                 symbol_size, use_fec, obj->priority,
-                                &t->round_robin_path, &schedule))
+                                &conn->round_robin_path, &schedule))
     return TRANSPORT_PUBLISH_ERROR;
 
   size_t parity_symbols = schedule.parity_symbols;
@@ -405,7 +407,7 @@ transport_publish_flush_grouped_ex(transport_t *t) {
                       .is_keyframe = false,
                       .priority = t->fec_priority};
   t->fec_in_flush = true;
-  transport_publish_result_t result = transport_publish_ex(t, &obj);
+  transport_publish_result_t result = transport_publish_impl(t, &obj);
   t->fec_in_flush = false;
   if (result != TRANSPORT_PUBLISH_DELIVERED &&
       result != TRANSPORT_PUBLISH_NO_RECIPIENTS)
@@ -447,8 +449,8 @@ bool transport_publish_finish_grouped(transport_t *t,
   return true;
 }
 
-transport_publish_result_t transport_publish_ex(transport_t *t,
-                                                const moq_object_t *obj) {
+static transport_publish_result_t
+transport_publish_impl(transport_t *t, const moq_object_t *obj) {
   if (!transport_owner_ok(t) || !obj ||
       !transport_track_id_valid(&obj->track_id) ||
       (obj->size > 0 && !obj->data))
@@ -599,7 +601,8 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
                                 " for MoQ track alias %d",
                                 sub->stream->stream_id, sub->alias);
           } else {
-            fprintf(stderr, "Failed to open reliable track stream: %d\n", err);
+            transport_log(t, TRANSPORT_LOG_ERROR, "stream", conn->id, SIZE_MAX,
+                          "failed to open reliable track stream: %d", err);
             failed = true;
             continue;
           }
@@ -691,6 +694,37 @@ transport_publish_result_t transport_publish_ex(transport_t *t,
   if (delivered == 0)
     return eligible == 0 ? TRANSPORT_PUBLISH_NO_RECIPIENTS : failure;
   return TRANSPORT_PUBLISH_DELIVERED;
+}
+
+transport_publish_result_t transport_publish_ex(transport_t *t,
+                                                const moq_object_t *obj) {
+  if (!transport_owner_ok(t))
+    return TRANSPORT_PUBLISH_INVALID;
+  transport_publish_result_t result = transport_publish_impl(t, obj);
+  switch (result) {
+  case TRANSPORT_PUBLISH_DELIVERED:
+    t->stats.publish_delivered++;
+    break;
+  case TRANSPORT_PUBLISH_BUFFERED:
+    t->stats.publish_buffered++;
+    break;
+  case TRANSPORT_PUBLISH_NO_RECIPIENTS:
+    t->stats.publish_no_recipients++;
+    break;
+  case TRANSPORT_PUBLISH_PARTIAL:
+    t->stats.publish_partial++;
+    break;
+  case TRANSPORT_PUBLISH_BACKPRESSURE:
+    t->stats.publish_backpressure++;
+    break;
+  case TRANSPORT_PUBLISH_INVALID:
+    t->stats.publish_invalid++;
+    break;
+  case TRANSPORT_PUBLISH_ERROR:
+    t->stats.publish_errors++;
+    break;
+  }
+  return result;
 }
 
 bool transport_publish(transport_t *t, const moq_object_t *obj) {

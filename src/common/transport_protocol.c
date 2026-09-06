@@ -25,8 +25,7 @@ static uint32_t local_capabilities(void) {
   return QLINQ_WIRE_CAP_RELIABLE | QLINQ_WIRE_CAP_DATAGRAM |
          QLINQ_WIRE_CAP_FEC_REED_SOLOMON | QLINQ_WIRE_CAP_FEC_RATELESS |
          QLINQ_WIRE_CAP_MULTIPATH | QLINQ_WIRE_CAP_AUTHENTICATION |
-         QLINQ_WIRE_CAP_RATELESS_REPAIR |
-         QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS;
+         QLINQ_WIRE_CAP_RATELESS_REPAIR | QLINQ_WIRE_CAP_RECOVERY_CHECKPOINTS;
 }
 
 bool transport_protocol_send_hello(transport_conn_t *conn) {
@@ -60,9 +59,17 @@ void transport_protocol_maybe_emit_connected(transport_conn_t *conn) {
       !conn->protocol_ready)
     return;
   conn->connected_emitted = true;
-  conn->transport->stats.protocol_handshakes_completed++;
+  transport_t *t = conn->transport;
+  t->stats.protocol_handshakes_completed++;
+  if (t->reconnect_in_progress) {
+    t->stats.reconnect_succeeded++;
+    t->reconnect_in_progress = false;
+    t->reconnect_current_delay_ms = t->reconnect_initial_delay_ms;
+    transport_log(t, TRANSPORT_LOG_INFO, "connection", conn->id, SIZE_MAX,
+                  "reconnect completed");
+  }
   transport_event_t event = {.type = TRANSPORT_EVENT_CONNECTED, .conn = conn};
-  transport_emit_event(conn->transport, &event);
+  transport_emit_event(t, &event);
 }
 
 static bool receive_hello(transport_conn_t *conn, const uint8_t *payload,
@@ -579,8 +586,8 @@ static void parse_control_messages(transport_t *t, transport_conn_t *conn,
             bool built =
                 indices_valid &&
                 (repair_mode == TRANSPORT_REPAIR_MODE_RATELESS
-                     ? transport_repair_build_rateless(
-                           &t->fec_cache, cached, missing_count, &repair)
+                     ? transport_repair_build_rateless(&t->fec_cache, cached,
+                                                       missing_count, &repair)
                      : transport_repair_build(&t->fec_cache, cached,
                                               whole_object, missing,
                                               missing_count, &repair));

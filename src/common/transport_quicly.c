@@ -25,6 +25,7 @@
 #include <fcntl.h>
 #include <inttypes.h>
 #include <pthread.h>
+#include <stdarg.h>
 #include <stdio.h>
 #include <stdlib.h>
 #include <string.h>
@@ -107,6 +108,39 @@ void transport_emit_event(transport_t *t, const transport_event_t *event) {
   t->callback_depth--;
 }
 
+void transport_log(transport_t *t, transport_log_level_t level,
+                   const char *component, uint32_t connection_id,
+                   size_t path_index, const char *format, ...) {
+  if (!t || !component || !format)
+    return;
+  char message[512];
+  va_list args;
+  va_start(args, format);
+  (void)vsnprintf(message, sizeof(message), format, args);
+  va_end(args);
+  transport_log_event_t event = {.level = level,
+                                 .component = component,
+                                 .connection_id = connection_id,
+                                 .path_index = path_index,
+                                 .message = message};
+  if (t->log_callback) {
+    t->log_callback(t->log_user_data, &event);
+  } else if (level >= TRANSPORT_LOG_WARNING) {
+    const char *name = level == TRANSPORT_LOG_ERROR ? "error" : "warning";
+    if (connection_id != 0 && path_index != SIZE_MAX)
+      fprintf(stderr, "qlinq[%s] %s conn=%" PRIu32 " path=%zu: %s\n", component,
+              name, connection_id, path_index, message);
+    else if (connection_id != 0)
+      fprintf(stderr, "qlinq[%s] %s conn=%" PRIu32 ": %s\n", component, name,
+              connection_id, message);
+    else if (path_index != SIZE_MAX)
+      fprintf(stderr, "qlinq[%s] %s path=%zu: %s\n", component, name,
+              path_index, message);
+    else
+      fprintf(stderr, "qlinq[%s] %s: %s\n", component, name, message);
+  }
+}
+
 static bool transport_has_connection(const transport_t *t,
                                      const transport_conn_t *conn);
 
@@ -155,6 +189,45 @@ static void copy_interface_name(char destination[64], const char *name) {
   strncpy(destination, name, 63);
   destination[63] = '\0';
 }
+
+static quicly_error_t
+qlinq_path_scheduler_send(quicly_path_scheduler_t *scheduler,
+                          quicly_conn_t *quic,
+                          quicly_send_context_t *send_context) {
+  (void)scheduler;
+  transport_conn_t *conn = *(transport_conn_t **)quicly_get_data(quic);
+  if (!conn || !conn->transport)
+    return 0;
+  transport_t *t = conn->transport;
+  for (size_t offset = 0; offset < TRANSPORT_MAX_QUIC_PATHS; offset++) {
+    size_t path = (conn->round_robin_path + offset) % TRANSPORT_MAX_QUIC_PATHS;
+    if (!quicly_is_path_available(quic, path))
+      continue;
+    bool has_socket = false;
+    for (size_t physical = 0; physical < t->num_fds; physical++) {
+      if (transport_path_find_by_link(quic, t->local_addrs, t->num_fds,
+                                      physical) == path) {
+        has_socket = true;
+        break;
+      }
+    }
+    if (!has_socket)
+      continue;
+    size_t packets_sent = 0;
+    quicly_error_t ret =
+        quicly_send_on_path(quic, send_context, path, &packets_sent);
+    if (ret != 0)
+      return ret;
+    if (packets_sent != 0) {
+      conn->round_robin_path = (path + 1U) % TRANSPORT_MAX_QUIC_PATHS;
+      break;
+    }
+  }
+  return 0;
+}
+
+static quicly_path_scheduler_t qlinq_path_scheduler = {
+    qlinq_path_scheduler_send};
 
 static bool ifmon_address_matches(const ifmon_addr_t *address,
                                   const struct sockaddr_storage *local) {
@@ -358,14 +431,14 @@ static bool set_fd_nonblocking(int fd) {
   return flags >= 0 && fcntl(fd, F_SETFL, flags | O_NONBLOCK) == 0;
 }
 
-static void configure_socket_buffers(int fd) {
+static void configure_socket_buffers(transport_t *t, int fd) {
   int buf_size = 2 * 1024 * 1024; /* 2mb buffer size */
   if (setsockopt(fd, SOL_SOCKET, SO_SNDBUF, &buf_size, sizeof(buf_size)) != 0)
-    fprintf(stderr, "transport: unable to enlarge send buffer: %s\n",
-            strerror(errno));
+    transport_log(t, TRANSPORT_LOG_WARNING, "udp", 0, SIZE_MAX,
+                  "unable to enlarge send buffer: %s", strerror(errno));
   if (setsockopt(fd, SOL_SOCKET, SO_RCVBUF, &buf_size, sizeof(buf_size)) != 0)
-    fprintf(stderr, "transport: unable to enlarge receive buffer: %s\n",
-            strerror(errno));
+    transport_log(t, TRANSPORT_LOG_WARNING, "udp", 0, SIZE_MAX,
+                  "unable to enlarge receive buffer: %s", strerror(errno));
 }
 
 #define QLINQ_PATH_OPEN_RETRY_MS 100U
@@ -386,6 +459,31 @@ static bool path_interface_allowed(const transport_t *t, const char *name) {
       return true;
   }
   return false;
+}
+
+static void remove_connection_physical_slot(transport_t *t,
+                                            size_t removed_index) {
+  size_t count = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  for (size_t c = 0; c < count; c++) {
+    transport_conn_t *conn = t->is_server ? t->conns[c] : t->client_conn;
+    if (!conn)
+      continue;
+    for (size_t i = removed_index; i + 1 < t->num_fds; i++) {
+      conn->path_states[i] = conn->path_states[i + 1];
+      conn->min_owd_ns[i] = conn->min_owd_ns[i + 1];
+      conn->latest_owd_fp[i] = conn->latest_owd_fp[i + 1];
+      conn->last_telemetry_s_ns[i] = conn->last_telemetry_s_ns[i + 1];
+      conn->last_telemetry_r_ns[i] = conn->last_telemetry_r_ns[i + 1];
+      conn->path_state_overridden[i] = conn->path_state_overridden[i + 1];
+    }
+    size_t last = t->num_fds - 1U;
+    memset(&conn->path_states[last], 0, sizeof(conn->path_states[last]));
+    conn->min_owd_ns[last] = 0;
+    conn->latest_owd_fp[last] = 0;
+    conn->last_telemetry_s_ns[last] = 0;
+    conn->last_telemetry_r_ns[last] = 0;
+    conn->path_state_overridden[last] = false;
+  }
 }
 
 static size_t select_remote_for_added_local(const transport_t *t,
@@ -442,12 +540,67 @@ static void try_open_pending_paths(transport_t *t, transport_conn_t *conn,
       /* The peer may not have supplied a path ID or CID yet. */
       t->path_open_retry_at[local_index] = now + QLINQ_PATH_OPEN_RETRY_MS;
     } else {
-      fprintf(stderr,
-              "transport: unable to open QUIC path for local slot "
-              "%zu: %" PRId64 "\n",
-              local_index, (int64_t)ret);
+      transport_log(t, TRANSPORT_LOG_ERROR, "path", conn->id, local_index,
+                    "unable to open QUIC path: %" PRId64, (int64_t)ret);
       t->path_open_pending[local_index] = false;
     }
+  }
+}
+
+static bool start_client_connection(transport_t *t) {
+  if (!t || t->is_server || t->num_remote_addrs == 0 || t->num_fds == 0 ||
+      t->client_conn)
+    return false;
+
+  transport_conn_t *conn = calloc(1, sizeof(*conn));
+  if (!conn)
+    return false;
+  conn->transport = t;
+  conn->id = t->next_conn_id++;
+  if (!transport_subscriptions_init(
+          &conn->subscriptions, t->limits.max_subscriptions_per_connection)) {
+    free(conn);
+    return false;
+  }
+
+  int ret = quicly_connect(&conn->quic, &t->quic_ctx, t->server_name,
+                           (struct sockaddr *)&t->remote_addrs[0],
+                           (struct sockaddr *)&t->local_addrs[0], &t->next_cid,
+                           ptls_iovec_init(NULL, 0), NULL, NULL, NULL);
+  if (ret != 0 || !conn->quic) {
+    transport_subscriptions_destroy(&conn->subscriptions);
+    free(conn);
+    return false;
+  }
+  /* Never reuse the client master CID. Reuse would let delayed packets from a
+   * prior session authenticate against a replacement connection after a peer
+   * restart. */
+  t->next_cid.master_id++;
+  *quicly_get_data(conn->quic) = conn;
+  if (quicly_open_stream(conn->quic, &conn->stream, 0) != 0 || !conn->stream) {
+    quicly_free(conn->quic);
+    transport_subscriptions_destroy(&conn->subscriptions);
+    free(conn);
+    return false;
+  }
+
+  t->client_conn = conn;
+  for (size_t i = 1; i < t->num_fds; i++) {
+    t->path_open_pending[i] = true;
+    t->path_open_retry_at[i] = 0;
+  }
+  return true;
+}
+
+static void schedule_client_reconnect(transport_t *t, int64_t now_ms) {
+  if (!t || t->is_server || !t->reconnect_enabled || t->shutting_down)
+    return;
+  t->reconnect_at_ms = now_ms + t->reconnect_current_delay_ms;
+  if (t->reconnect_current_delay_ms < t->reconnect_max_delay_ms) {
+    uint64_t next = (uint64_t)t->reconnect_current_delay_ms * 2U;
+    t->reconnect_current_delay_ms = next > t->reconnect_max_delay_ms
+                                        ? t->reconnect_max_delay_ms
+                                        : (uint32_t)next;
   }
 }
 
@@ -458,6 +611,13 @@ transport_t *transport_create(const transport_config_t *config) {
       config->num_path_interface_names > TRANSPORT_MAX_PATHS ||
       config->num_remote_hosts > TRANSPORT_MAX_PATHS ||
       config->simulated_loss_rate > 100 ||
+      (config->num_remote_hosts != 0 &&
+       (config->reconnect_initial_delay_ms != 0
+            ? config->reconnect_initial_delay_ms
+            : TRANSPORT_DEFAULT_RECONNECT_INITIAL_DELAY_MS) >
+           (config->reconnect_max_delay_ms != 0
+                ? config->reconnect_max_delay_ms
+                : TRANSPORT_DEFAULT_RECONNECT_MAX_DELAY_MS)) ||
       (!config->verify_peer && !config->allow_insecure_peer)) {
     if (config && config->callback && config->port != 0 &&
         config->num_bind_hosts > 0 &&
@@ -532,7 +692,8 @@ transport_t *transport_create(const transport_config_t *config) {
   }
 
   if (!transport_arena_init(&t->arena, 16U * 1024U * 1024U)) {
-    fprintf(stderr, "transport: failed to allocate packet arena\n");
+    transport_log(t, TRANSPORT_LOG_ERROR, "memory", 0, SIZE_MAX,
+                  "failed to allocate packet arena");
     for (size_t i = 0; i < TRANSPORT_MAX_PATHS; i++)
       transport_egress_destroy(&t->egress[i]);
     free(t->conns);
@@ -542,12 +703,29 @@ transport_t *transport_create(const transport_config_t *config) {
 
   t->callback = config->callback;
   t->user_data = config->user_data;
+  t->log_callback = config->log_callback;
+  t->log_user_data = config->log_user_data;
   t->is_server = (config->num_remote_hosts == 0);
+  t->reconnect_enabled = !t->is_server && config->reconnect_enabled;
+  t->reconnect_initial_delay_ms =
+      config->reconnect_initial_delay_ms != 0
+          ? config->reconnect_initial_delay_ms
+          : TRANSPORT_DEFAULT_RECONNECT_INITIAL_DELAY_MS;
+  t->reconnect_max_delay_ms = config->reconnect_max_delay_ms != 0
+                                  ? config->reconnect_max_delay_ms
+                                  : TRANSPORT_DEFAULT_RECONNECT_MAX_DELAY_MS;
+  t->reconnect_current_delay_ms = t->reconnect_initial_delay_ms;
   t->simulated_loss_rate = config->simulated_loss_rate;
   t->num_path_interface_names = config->num_path_interface_names;
   for (size_t i = 0; i < t->num_path_interface_names; i++)
     copy_interface_name(t->path_interface_names[i],
                         config->path_interface_names[i]);
+  if (config->allow_insecure_peer)
+    transport_log(t, TRANSPORT_LOG_WARNING, "tls", 0, SIZE_MAX,
+                  "peer certificate verification is disabled");
+  if (config->simulated_loss_rate != 0)
+    transport_log(t, TRANSPORT_LOG_WARNING, "simulation", 0, SIZE_MAX,
+                  "simulated packet loss is enabled");
 
   t->last_pathflow_update = ptls_get_time.cb(&ptls_get_time);
 
@@ -589,7 +767,9 @@ transport_t *transport_create(const transport_config_t *config) {
   t->quic_ctx.stream_open = &t->stream_open;
   t->quic_ctx.receive_datagram_frame = &t->receive_datagram;
 
-  t->quic_ctx.path_scheduler = &quicly_round_robin_path_scheduler;
+  /* Never select a validated QUIC path after its owning physical socket has
+   * been removed. Datagram scheduling applies the same invariant. */
+  t->quic_ctx.path_scheduler = &qlinq_path_scheduler;
 
   t->quic_ctx.initcwnd_packets = 100;
   t->quic_ctx.initial_egress_max_udp_payload_size =
@@ -613,8 +793,8 @@ transport_t *transport_create(const transport_config_t *config) {
       struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&t->local_addrs[i];
       sin6->sin6_family = AF_INET6;
       if (inet_pton(AF_INET6, config->bind_hosts[i], &sin6->sin6_addr) != 1) {
-        fprintf(stderr, "transport: invalid IPv6 bind address: %s\n",
-                config->bind_hosts[i]);
+        transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
+                      "invalid IPv6 bind address: %s", config->bind_hosts[i]);
         transport_destroy(t);
         return NULL;
       }
@@ -625,8 +805,8 @@ transport_t *transport_create(const transport_config_t *config) {
       struct sockaddr_in *sin = (struct sockaddr_in *)&t->local_addrs[i];
       sin->sin_family = AF_INET;
       if (inet_pton(AF_INET, config->bind_hosts[i], &sin->sin_addr) != 1) {
-        fprintf(stderr, "transport: invalid IPv4 bind address: %s\n",
-                config->bind_hosts[i]);
+        transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
+                      "invalid IPv4 bind address: %s", config->bind_hosts[i]);
         transport_destroy(t);
         return NULL;
       }
@@ -635,8 +815,8 @@ transport_t *transport_create(const transport_config_t *config) {
       t->fds[i] = socket(AF_INET, SOCK_DGRAM, 0);
     }
     if (t->fds[i] < 0) {
-      fprintf(stderr, "transport: socket creation failed: %s\n",
-              strerror(errno));
+      transport_log(t, TRANSPORT_LOG_ERROR, "udp", 0, i,
+                    "socket creation failed: %s", strerror(errno));
       transport_destroy(t);
       return NULL;
     }
@@ -644,21 +824,23 @@ transport_t *transport_create(const transport_config_t *config) {
     int reuse = 1;
     if (setsockopt(t->fds[i], SOL_SOCKET, SO_REUSEADDR, &reuse,
                    sizeof(reuse)) != 0)
-      fprintf(stderr, "transport: SO_REUSEADDR failed: %s\n", strerror(errno));
+      transport_log(t, TRANSPORT_LOG_WARNING, "udp", 0, i,
+                    "SO_REUSEADDR failed: %s", strerror(errno));
 
     if (bind(t->fds[i], (struct sockaddr *)&t->local_addrs[i],
              t->local_addrs_len[i]) != 0) {
-      fprintf(stderr, "transport: bind failed for %s:%u: %s\n",
-              config->bind_hosts[i], config->port, strerror(errno));
+      transport_log(t, TRANSPORT_LOG_ERROR, "udp", 0, i,
+                    "bind failed for %s:%u: %s", config->bind_hosts[i],
+                    config->port, strerror(errno));
       transport_destroy(t);
       return NULL;
     }
 
-    configure_socket_buffers(t->fds[i]);
+    configure_socket_buffers(t, t->fds[i]);
 
     if (!set_fd_nonblocking(t->fds[i])) {
-      fprintf(stderr, "transport: failed to make socket nonblocking: %s\n",
-              strerror(errno));
+      transport_log(t, TRANSPORT_LOG_ERROR, "udp", 0, i,
+                    "failed to make socket nonblocking: %s", strerror(errno));
       transport_destroy(t);
       return NULL;
     }
@@ -669,6 +851,8 @@ transport_t *transport_create(const transport_config_t *config) {
     if (transport_tls_load_certificate_and_key(&t->tls_ctx, &t->sign_cert,
                                                config->cert_file,
                                                config->key_file) != 0) {
+      transport_log(t, TRANSPORT_LOG_ERROR, "tls", 0, SIZE_MAX,
+                    "failed to load TLS identity");
       transport_destroy(t);
       return NULL;
     }
@@ -679,8 +863,9 @@ transport_t *transport_create(const transport_config_t *config) {
     if (config->ca_file) {
       store = X509_STORE_new();
       if (X509_STORE_load_locations(store, config->ca_file, NULL) != 1) {
-        fprintf(stderr, "failed to load CA certificates from %s\n",
-                config->ca_file);
+        transport_log(t, TRANSPORT_LOG_ERROR, "tls", 0, SIZE_MAX,
+                      "failed to load CA certificates from %s",
+                      config->ca_file);
         X509_STORE_free(store);
         transport_destroy(t);
         return NULL;
@@ -691,7 +876,8 @@ transport_t *transport_create(const transport_config_t *config) {
      * (if provided), or load the system default certificates if store is NULL
      */
     if (ptls_openssl_init_verify_certificate(&t->verifier, store) != 0) {
-      fprintf(stderr, "failed to initialize certificate verifier\n");
+      transport_log(t, TRANSPORT_LOG_ERROR, "tls", 0, SIZE_MAX,
+                    "failed to initialize certificate verifier");
       if (store) {
         X509_STORE_free(store);
       }
@@ -715,6 +901,13 @@ transport_t *transport_create(const transport_config_t *config) {
   }
 
   if (!t->is_server) {
+    if (strlen(config->remote_hosts[0]) >= sizeof(t->server_name)) {
+      transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, SIZE_MAX,
+                    "remote host name exceeds implementation limit");
+      transport_destroy(t);
+      return NULL;
+    }
+    strcpy(t->server_name, config->remote_hosts[0]);
     for (size_t i = 0; i < t->num_remote_addrs; i++) {
       if (strchr(config->remote_hosts[i], ':')) {
         struct sockaddr_in6 *sin6 = (struct sockaddr_in6 *)&t->remote_addrs[i];
@@ -722,6 +915,9 @@ transport_t *transport_create(const transport_config_t *config) {
         sin6->sin6_port = htons(config->port);
         if (inet_pton(AF_INET6, config->remote_hosts[i], &sin6->sin6_addr) !=
             1) {
+          transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
+                        "invalid IPv6 remote address: %s",
+                        config->remote_hosts[i]);
           transport_destroy(t);
           return NULL;
         }
@@ -731,6 +927,9 @@ transport_t *transport_create(const transport_config_t *config) {
         sin->sin_family = AF_INET;
         sin->sin_port = htons(config->port);
         if (inet_pton(AF_INET, config->remote_hosts[i], &sin->sin_addr) != 1) {
+          transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
+                        "invalid IPv4 remote address: %s",
+                        config->remote_hosts[i]);
           transport_destroy(t);
           return NULL;
         }
@@ -739,58 +938,27 @@ transport_t *transport_create(const transport_config_t *config) {
     }
 
     if (t->num_remote_addrs > 1 && t->num_fds > t->num_remote_addrs) {
-      fprintf(stderr,
-              "transport: multiple remote hosts require at least one remote "
-              "for each configured bind host\n");
+      transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, SIZE_MAX,
+                    "multiple remote hosts require at least one remote for "
+                    "each configured bind host");
       transport_destroy(t);
       return NULL;
     }
     for (size_t i = 0; i < t->num_fds; i++) {
       size_t remote_index = t->num_remote_addrs == 1 ? 0 : i;
       if (!path_endpoint_families_match(t, i, remote_index)) {
-        fprintf(stderr,
-                "transport: bind host %zu and remote host %zu use different "
-                "address families\n",
-                i, remote_index);
+        transport_log(t, TRANSPORT_LOG_ERROR, "config", 0, i,
+                      "remote host %zu uses a different address family",
+                      remote_index);
         transport_destroy(t);
         return NULL;
       }
       t->local_remote_indices[i] = remote_index;
     }
 
-    transport_conn_t *conn = calloc(1, sizeof(transport_conn_t));
-    if (!conn) {
-      transport_destroy(t);
-      return NULL;
-    }
-    conn->transport = t;
-    conn->id = t->next_conn_id++;
-    if (!transport_subscriptions_init(
-            &conn->subscriptions, t->limits.max_subscriptions_per_connection)) {
-      free(conn);
-      transport_destroy(t);
-      return NULL;
-    }
-
-    int ret =
-        quicly_connect(&conn->quic, &t->quic_ctx, config->remote_hosts[0],
-                       (struct sockaddr *)&t->remote_addrs[0],
-                       (struct sockaddr *)&t->local_addrs[0], &t->next_cid,
-                       ptls_iovec_init(NULL, 0), NULL, NULL, NULL);
-    if (ret != 0) {
-      transport_subscriptions_destroy(&conn->subscriptions);
-      free(conn);
-      transport_destroy(t);
-      return NULL;
-    }
-
-    *quicly_get_data(conn->quic) = conn;
-    t->client_conn = conn;
-    for (size_t i = 1; i < t->num_fds; i++)
-      t->path_open_pending[i] = true;
-
-    if (quicly_open_stream(conn->quic, &conn->stream, 0) != 0 ||
-        !conn->stream) {
+    if (!start_client_connection(t)) {
+      transport_log(t, TRANSPORT_LOG_ERROR, "connection", 0, SIZE_MAX,
+                    "failed to create initial client connection");
       transport_destroy(t);
       return NULL;
     }
@@ -884,8 +1052,21 @@ void transport_tick(transport_t *t) {
   for (size_t i = 0; i < t->num_fds; i++)
     (void)transport_egress_flush(&t->egress[i], t->fds[i]);
 
-  /* Sweep active assemblers for 10ms NACK retries */
   int64_t now_nack_ms = transport_get_time_ms();
+  if (!t->is_server && !t->client_conn && t->reconnect_enabled &&
+      !t->shutting_down && now_nack_ms >= t->reconnect_at_ms) {
+    t->stats.reconnect_attempts++;
+    t->reconnect_in_progress = true;
+    if (!start_client_connection(t)) {
+      t->stats.reconnect_failed++;
+      t->reconnect_in_progress = false;
+      schedule_client_reconnect(t, now_nack_ms);
+      transport_log(t, TRANSPORT_LOG_WARNING, "connection", 0, SIZE_MAX,
+                    "reconnect attempt failed; retry scheduled");
+    }
+  }
+
+  /* Sweep active assemblers for 10ms NACK retries */
   size_t object_nack_budget = 32;
   size_t active_conns = t->is_server ? t->conn_count : (t->client_conn ? 1 : 0);
   for (size_t c = 0; c < active_conns; c++) {
@@ -1068,9 +1249,9 @@ void transport_tick(transport_t *t) {
             int reuse = 1;
             if (setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &reuse,
                            sizeof(reuse)) != 0)
-              fprintf(stderr, "ifmon: SO_REUSEADDR failed: %s\n",
-                      strerror(errno));
-            configure_socket_buffers(fd);
+              transport_log(t, TRANSPORT_LOG_WARNING, "ifmon", 0, t->num_fds,
+                            "SO_REUSEADDR failed: %s", strerror(errno));
+            configure_socket_buffers(t, fd);
             if (msg.addr.ss_family == AF_INET) {
               ((struct sockaddr_in *)&msg.addr)->sin_port =
                   t->is_server
@@ -1143,8 +1324,8 @@ void transport_tick(transport_t *t) {
                           &((struct sockaddr_in6 *)&msg.addr)->sin6_addr,
                           ip_str, sizeof(ip_str));
               }
-              fprintf(stderr, "ifmon: opened new socket for local IP %s\n",
-                      ip_str);
+              transport_log(t, TRANSPORT_LOG_INFO, "ifmon", 0, local_index,
+                            "opened socket for local IP %s", ip_str);
 
             } else {
               CLOSE_SOCKET(fd);
@@ -1176,6 +1357,7 @@ void transport_tick(transport_t *t) {
             accumulate_egress_stats(t, &t->egress[i], true);
             transport_egress_destroy(&t->egress[i]);
             CLOSE_SOCKET(t->fds[i]);
+            remove_connection_physical_slot(t, i);
             /* remove from array */
             for (size_t j = i; j < t->num_fds - 1; j++) {
               t->fds[j] = t->fds[j + 1];
@@ -1198,7 +1380,8 @@ void transport_tick(transport_t *t) {
             t->local_remote_indices[t->num_fds] = SIZE_MAX;
             t->path_open_pending[t->num_fds] = false;
             t->path_open_retry_at[t->num_fds] = 0;
-            fprintf(stderr, "ifmon: removed socket for local IP\n");
+            transport_log(t, TRANSPORT_LOG_INFO, "ifmon", 0, i,
+                          "removed socket for local IP");
             break;
           }
         }
@@ -1243,7 +1426,8 @@ void transport_tick(transport_t *t) {
               break;
             }
           }
-          if (!target && t->conn_count < t->limits.max_connections) {
+          if (!target && !t->shutting_down &&
+              t->conn_count < t->limits.max_connections) {
             quicly_conn_t *new_quic = NULL;
             quicly_cid_plaintext_t connection_cid = t->next_cid;
             int accept_res =
@@ -1274,7 +1458,7 @@ void transport_tick(transport_t *t) {
               t->conns[t->conn_count++] = target;
               t->stats.connections_accepted++;
             }
-          } else if (!target) {
+          } else if (!target && !t->shutting_down) {
             t->stats.connections_rejected++;
           }
         } else {
@@ -1435,20 +1619,47 @@ void transport_tick(transport_t *t) {
 
         if (out_fd_index == SIZE_MAX) {
           t->stats.udp_send_errors += num_dgrams;
-          fprintf(stderr,
-                  "transport: no UDP socket matches QUIC source address\n");
+          transport_log(t, TRANSPORT_LOG_ERROR, "udp", conn->id, SIZE_MAX,
+                        "no socket matches QUIC source address");
           continue;
         }
 
         if (!transport_egress_submit(
                 &t->egress[out_fd_index], t->fds[out_fd_index], &dest.sa,
                 quicly_get_socklen(&dest.sa), dgrams, num_dgrams))
-          fprintf(stderr, "transport: UDP egress queue exhausted\n");
+          transport_log(t, TRANSPORT_LOG_WARNING, "udp", conn->id, out_fd_index,
+                        "egress queue exhausted");
       } else if (send_res == QUICLY_ERROR_FREE_CONNECTION) {
-        fprintf(stderr, "Connection %p freed (is_server=%d)\n", conn,
-                t->is_server);
-        transport_event_t ev = {.type = TRANSPORT_EVENT_DISCONNECTED,
-                                .conn = conn};
+        uint64_t offending_frame_type = UINT64_MAX;
+        const char *reason = "";
+        int is_remote = 0;
+        quicly_error_t close_error = quicly_get_close_reason(
+            conn->quic, &offending_frame_type, &reason, &is_remote);
+        bool application_error = QUICLY_ERROR_IS_QUIC_APPLICATION(close_error);
+        uint64_t error_code = QUICLY_ERROR_IS_QUIC(close_error)
+                                  ? QUICLY_ERROR_GET_ERROR_CODE(close_error)
+                                  : (uint64_t)close_error;
+        if (!reason)
+          reason = "";
+        transport_log(t, TRANSPORT_LOG_INFO, "connection", conn->id, SIZE_MAX,
+                      "closed origin=%s class=%s error=%" PRIu64 " raw=%" PRId64
+                      " reason=%s",
+                      is_remote ? "remote" : "local",
+                      application_error
+                          ? "application"
+                          : (QUICLY_ERROR_IS_QUIC(close_error) ? "transport"
+                                                               : "internal"),
+                      error_code, (int64_t)close_error,
+                      reason[0] ? reason : "none");
+        transport_event_t ev = {
+            .type = TRANSPORT_EVENT_DISCONNECTED,
+            .conn = conn,
+            .disconnect = {.error_code = error_code,
+                           .raw_error = (int64_t)close_error,
+                           .application_error = application_error,
+                           .offending_frame_type = offending_frame_type,
+                           .remote = is_remote != 0,
+                           .reason = reason}};
         transport_emit_event(t, &ev);
         t->stats.connections_closed++;
 
@@ -1468,6 +1679,7 @@ void transport_tick(transport_t *t) {
         } else {
           t->client_conn = NULL;
           active_count = 0;
+          schedule_client_reconnect(t, transport_get_time_ms());
         }
         break;
       } else {
@@ -1612,8 +1824,72 @@ void transport_close_conn(transport_t *t, transport_conn_t *conn) {
   if (!transport_owner_ok(t))
     return;
   if (transport_has_connection(t, conn) && conn->quic) {
-    quicly_close(conn->quic, 0, "");
+    quicly_close(conn->quic, 0, "application close");
   }
+}
+
+void transport_shutdown(transport_t *t, const char *reason) {
+  if (!transport_owner_ok(t))
+    return;
+  t->shutting_down = true;
+  t->reconnect_in_progress = false;
+  const char *phrase = reason && reason[0] ? reason : "application shutdown";
+  size_t count = t->is_server ? t->conn_count : (t->client_conn ? 1U : 0U);
+  for (size_t i = 0; i < count; i++) {
+    transport_conn_t *conn = t->is_server ? t->conns[i] : t->client_conn;
+    if (conn && conn->quic &&
+        quicly_get_state(conn->quic) < QUICLY_STATE_CLOSING)
+      (void)quicly_close(conn->quic, 0, phrase);
+  }
+}
+
+bool transport_is_drained(transport_t *t) {
+  if (!transport_owner_ok(t))
+    return false;
+  if (t->is_server ? t->conn_count != 0 : t->client_conn != NULL)
+    return false;
+  for (size_t i = 0; i < t->num_fds; i++) {
+    if (t->egress[i].count != 0)
+      return false;
+  }
+  return true;
+}
+
+static void dispose_tls_identity(ptls_context_t *tls,
+                                 ptls_openssl_sign_certificate_t *signer) {
+  if (!tls || !signer)
+    return;
+  if (tls->sign_certificate)
+    ptls_openssl_dispose_sign_certificate(signer);
+  for (size_t i = 0; i < tls->certificates.count; i++)
+    free(tls->certificates.list[i].base);
+  free(tls->certificates.list);
+  tls->certificates.list = NULL;
+  tls->certificates.count = 0;
+  tls->sign_certificate = NULL;
+}
+
+bool transport_reload_credentials(transport_t *t, const char *cert_file,
+                                  const char *key_file) {
+  if (!transport_owner_ok(t) || !cert_file || !key_file)
+    return false;
+  ptls_context_t candidate = {0};
+  ptls_openssl_sign_certificate_t candidate_signer = {0};
+  if (transport_tls_load_certificate_and_key(&candidate, &candidate_signer,
+                                             cert_file, key_file) != 0) {
+    dispose_tls_identity(&candidate, &candidate_signer);
+    transport_log(t, TRANSPORT_LOG_ERROR, "tls", 0, SIZE_MAX,
+                  "credential reload failed; retaining current identity");
+    return false;
+  }
+
+  dispose_tls_identity(&t->tls_ctx, &t->sign_cert);
+  t->sign_cert = candidate_signer;
+  t->tls_ctx.certificates = candidate.certificates;
+  t->tls_ctx.sign_certificate = &t->sign_cert.super;
+  transport_log(t, TRANSPORT_LOG_INFO, "tls", 0, SIZE_MAX,
+                "credentials reloaded for future handshakes");
+  return true;
 }
 
 bool transport_send_auth(transport_t *t, transport_conn_t *conn,
@@ -1830,16 +2106,31 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
 
   transport_conn_t *target =
       t->is_server ? (t->conn_count > 0 ? t->conns[0] : NULL) : t->client_conn;
+  stats->lifecycle = t->shutting_down
+                         ? TRANSPORT_PATH_DRAINING
+                         : (target ? TRANSPORT_PATH_DISCOVERED
+                                   : (t->is_server ? TRANSPORT_PATH_DISCOVERED
+                                                   : TRANSPORT_PATH_FAILED));
   if (target && target->quic) {
     quicly_path_stats_t path_stats;
     size_t mapped_path_idx = transport_path_find_by_link(
         target->quic, t->local_addrs, t->num_fds, path_idx);
-    if (mapped_path_idx < TRANSPORT_MAX_QUIC_PATHS &&
-        quicly_get_path_stats(target->quic, mapped_path_idx, &path_stats) ==
-            0) {
+    if (quicly_get_state(target->quic) >= QUICLY_STATE_CLOSING) {
+      stats->lifecycle = TRANSPORT_PATH_DRAINING;
+    } else if (mapped_path_idx >= TRANSPORT_MAX_QUIC_PATHS) {
+      stats->lifecycle = t->path_open_pending[path_idx]
+                             ? TRANSPORT_PATH_OPENING
+                             : TRANSPORT_PATH_DISCOVERED;
+    } else if (!quicly_is_path_available(target->quic, mapped_path_idx)) {
+      stats->lifecycle = TRANSPORT_PATH_VALIDATING;
+    } else if (quicly_get_path_stats(target->quic, mapped_path_idx,
+                                     &path_stats) == 0) {
+      stats->lifecycle = TRANSPORT_PATH_ACTIVE;
       stats->sent = path_stats.sent;
       stats->lost = path_stats.lost;
       stats->rtt = path_stats.rtt_smoothed;
+    } else {
+      stats->lifecycle = TRANSPORT_PATH_FAILED;
     }
   }
 
@@ -1854,21 +2145,31 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
   return true;
 }
 
-/* mock a local IP interface addition for testing multipath */
-void transport_mock_iface_add(transport_t *t, const char *ip_addr) {
+static void transport_mock_iface_change(transport_t *t, const char *ip_addr,
+                                        bool added) {
   if (!transport_owner_ok(t) || t->ifmon_pipe[1] < 0)
     return;
 
   ifmon_pipe_msg_t msg = {0};
-  msg.is_added = 1;
+  msg.is_added = added ? 1 : 0;
   msg.index = 1; /* loopback interface index */
   struct sockaddr_in *sin = (struct sockaddr_in *)&msg.addr;
   sin->sin_family = AF_INET;
-  inet_pton(AF_INET, ip_addr, &sin->sin_addr);
+  if (!ip_addr || inet_pton(AF_INET, ip_addr, &sin->sin_addr) != 1)
+    return;
   msg.addr_len = sizeof(*sin);
 
   ssize_t w = write(t->ifmon_pipe[1], &msg, sizeof(msg));
   (void)w;
+}
+
+/* deterministic interface changes for integration tests */
+void transport_mock_iface_add(transport_t *t, const char *ip_addr) {
+  transport_mock_iface_change(t, ip_addr, true);
+}
+
+void transport_mock_iface_remove(transport_t *t, const char *ip_addr) {
+  transport_mock_iface_change(t, ip_addr, false);
 }
 
 bool transport_mock_path_state(transport_t *t, size_t path_idx,
@@ -1986,6 +2287,10 @@ int64_t transport_get_first_timeout(transport_t *t) {
     return INT64_MAX;
 
   int64_t first_timeout = INT64_MAX;
+
+  if (!t->is_server && !t->client_conn && t->reconnect_enabled &&
+      !t->shutting_down && t->reconnect_at_ms < first_timeout)
+    first_timeout = t->reconnect_at_ms;
 
   if (t->client_conn && t->client_conn->quic) {
     int64_t to = quicly_get_first_timeout(t->client_conn->quic);

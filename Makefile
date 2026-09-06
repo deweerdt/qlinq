@@ -6,6 +6,10 @@ ARCH = $(shell uname -m)
 
 # Default CFLAGS for our code
 CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DPATHFLOW_ARENA_SIZE=65536
+# Quicly's encoder capacity helpers intentionally perform arithmetic from a
+# null base pointer. Exclude that one UBSan check while retaining ASan and all
+# other undefined-behavior checks across qlinq and its linked dependencies.
+SANITIZER_FLAGS = -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-sanitize=pointer-overflow
 # Quicly is included with -isystem to keep third-party warnings out of qlinq's
 # build. Use -MD so ABI-affecting Quicly and picotls headers remain tracked.
 DEPFLAGS = -MD -MP
@@ -151,6 +155,37 @@ t/00util/fuzz_transport_wire: t/00util/fuzz_transport_wire.c src/common/transpor
 fuzz-wire: t/00util/fuzz_transport_wire
 	ASAN_OPTIONS=detect_leaks=0 ./t/00util/fuzz_transport_wire -runs=10000
 
+check-submodules:
+	./scripts/check_submodules.sh
+
+check-multipath-demo:
+	@if [ "$${QLINQ_SKIP_PRIVILEGED:-0}" = 1 ]; then \
+		echo "SKIP privileged multipath demo (QLINQ_SKIP_PRIVILEGED=1)"; \
+	else \
+		./examples/multipath_demo.sh; \
+	fi
+
+check-sanitize:
+	$(MAKE) clean
+	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
+	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
+	$(MAKE) check CC=clang CFLAGS="$(SANITIZER_FLAGS)" \
+		LDFLAGS="$(SANITIZER_FLAGS) -lpthread -lrt -ldl -lm -lcrypto -lssl"
+
+soak: t/00util/test_operational t/00util/test_transport \
+	t/00util/test_multipath_nack gencerts
+	./scripts/operational_soak.sh
+
+release-check: check-submodules
+	$(MAKE) clean
+	$(MAKE) check
+	$(MAKE) fuzz-wire
+	$(MAKE) check-sanitize
+	$(MAKE) clean
+	$(MAKE) all examples/data_multipath_benchmark gencerts
+	$(MAKE) check-multipath-demo
+	@echo "=== RELEASE CHECK OK ==="
+
 t/00util/test_benchmark: t/00util/test_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
 
@@ -163,6 +198,12 @@ t/00util/test_multipath: t/00util/test_multipath.o $(COMMON_OBJS)
 t/00util/test_multipath_nack: t/00util/test_multipath_nack.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_multipath_nack.o $(COMMON_OBJS) $(LDFLAGS)
 
+t/00util/test_operational: t/00util/test_operational.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_operational.o $(COMMON_OBJS) $(LDFLAGS)
+
+t/00util/test_tls: t/00util/test_tls.o $(COMMON_OBJS)
+	$(CC) -o $@ t/00util/test_tls.o $(COMMON_OBJS) $(LDFLAGS)
+
 t/00util/test_rateless_benchmark: t/00util/test_rateless_benchmark.o $(COMMON_OBJS)
 	$(CC) -o $@ t/00util/test_rateless_benchmark.o $(COMMON_OBJS) $(LDFLAGS)
 
@@ -173,7 +214,7 @@ benchmark-rateless: t/00util/test_rateless_benchmark
 	./t/00util/test_rateless_benchmark
 
 clean: 
-	rm -f qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
+	rm -f qlinqd qlinq-app qlinq-tund libqlinq.a t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/fuzz_transport_wire t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls t/00util/test_benchmark t/00util/test_rateless_benchmark t/00util/test_tc_benchmark examples/data_multipath_benchmark
 	find src deps t examples -name "*.o" -delete
 	find src t examples -name "*.d" -delete
 	rm -f $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \
@@ -181,19 +222,48 @@ clean:
 		deps/nanors/deps/obl/oblas_common.d \
 		deps/nanors/deps/obl/oblas_lite.d
 
-check: qlinqd qlinq-app qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack gencerts
+check: qlinqd qlinq-app qlinq-tund t/00util/test_fec t/00util/test_transport t/00util/test_tund t/00util/test_data_uds t/00util/test_transport_wire t/00util/test_transport_components t/00util/test_multipath t/00util/test_multipath_nack t/00util/test_operational t/00util/test_tls gencerts
 	prove -I. -v t/*.t
 
 t/assets/server.crt t/assets/server.key &:
 	mkdir -p t/assets
 	openssl req -x509 -nodes -days 365 -newkey rsa:2048 -keyout t/assets/server.key -out t/assets/server.crt -subj "/CN=localhost"
 
-gencerts: t/assets/server.crt t/assets/server.key
+t/assets/verified.crt t/assets/verified.key &:
+	mkdir -p t/assets
+	openssl req -x509 -nodes -days 7 -newkey rsa:2048 \
+		-keyout t/assets/verified.key -out t/assets/verified.crt \
+		-subj "/CN=localhost" -addext "subjectAltName=IP:127.0.0.1,DNS:localhost" \
+		-addext "basicConstraints=critical,CA:TRUE" \
+		-addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" \
+		-addext "extendedKeyUsage=serverAuth,clientAuth"
+
+t/assets/verified-v6.crt t/assets/verified-v6.key &:
+	mkdir -p t/assets
+	openssl req -x509 -nodes -days 7 -newkey rsa:2048 \
+		-keyout t/assets/verified-v6.key -out t/assets/verified-v6.crt \
+		-subj "/CN=localhost" -addext "subjectAltName=IP:::1,DNS:localhost" \
+		-addext "basicConstraints=critical,CA:TRUE" \
+		-addext "keyUsage=critical,digitalSignature,keyEncipherment,keyCertSign" \
+		-addext "extendedKeyUsage=serverAuth,clientAuth"
+
+t/assets/untrusted.crt t/assets/untrusted.key &:
+	mkdir -p t/assets
+	openssl req -x509 -nodes -days 7 -newkey rsa:2048 \
+		-keyout t/assets/untrusted.key -out t/assets/untrusted.crt \
+		-subj "/CN=untrusted" -addext "basicConstraints=critical,CA:TRUE"
+
+t/assets/unsafe.key: t/assets/verified.key
+	cp $< $@
+	chmod 0644 $@
+
+gencerts: t/assets/server.crt t/assets/server.key t/assets/verified.crt t/assets/verified.key t/assets/verified-v6.crt t/assets/verified-v6.key t/assets/untrusted.crt t/assets/untrusted.key t/assets/unsafe.key
 
 indent:
 	clang-format -style=LLVM -i src/common/*.c src/common/*.h src/host/linux/*.c examples/*.c t/00util/*.c
 
-.PHONY: all clean check benchmark fuzz-wire indent gencerts
+.PHONY: all clean check benchmark fuzz-wire check-submodules \
+	check-multipath-demo check-sanitize soak release-check indent gencerts
 
 -include $(shell find src t examples -name "*.d" -print 2>/dev/null) \
          $(QUICLY_OBJS:.o=.d) $(NANORQ_OBJS:.o=.d) \

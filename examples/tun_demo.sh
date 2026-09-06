@@ -8,7 +8,7 @@ mkdir -p logs
 
 # 1. Compile all required daemons
 echo "Compiling qlinq host, client, and tun daemons..."
-make qlinqd qlinq-tund
+make qlinqd qlinq-tund gencerts
 
 # 2. Run the comparison benchmark inside an unshared user/network/mount namespace
 echo "Launching virtual tunnel benchmark inside isolated namespace stack..."
@@ -59,9 +59,9 @@ unshare -Urnm bash -c '
     # RUN 1: RaptorQ FEC Datagram Mode
     # ========================================================
     echo "=== RUN 1: RaptorQ FEC Datagram Mode ==="
-    ip netns exec ns_host ./qlinqd --listen 8888 --bind 192.168.1.1 --socket qlinq-data --track tund/tun-client > logs/host_fec.log 2>&1 &
+    ip netns exec ns_host ./qlinqd --listen 8888 --bind 192.168.1.1 --socket qlinq-data --track tund/tun-client --cert t/assets/server.crt --key t/assets/server.key --auth-token demo --insecure-no-verify > logs/host_fec.log 2>&1 &
     PID_HOST=$!
-    ip netns exec ns_client ./qlinqd --peer 192.168.1.1:8888 --socket qlinq-data-client --track tund/tun-host > logs/client_fec.log 2>&1 &
+    ip netns exec ns_client ./qlinqd --peer 192.168.1.1:8888 --socket qlinq-data-client --track tund/tun-host --auth-token demo --insecure-no-verify > logs/client_fec.log 2>&1 &
     PID_CLIENT=$!
     sleep 2
 
@@ -108,9 +108,9 @@ print(m.group(2) + \" ms\" if m else \"N/A\")
     # RUN 2: Vanilla Reliable QUIC Stream Mode
     # ========================================================
     echo "=== RUN 2: Vanilla Reliable QUIC Stream Mode ==="
-    ip netns exec ns_host ./qlinqd --listen 8888 --bind 192.168.1.1 --socket qlinq-data --track tund/tun-client --reliable > logs/host_reliable.log 2>&1 &
+    ip netns exec ns_host ./qlinqd --listen 8888 --bind 192.168.1.1 --socket qlinq-data --track tund/tun-client --reliable --cert t/assets/server.crt --key t/assets/server.key --auth-token demo --insecure-no-verify > logs/host_reliable.log 2>&1 &
     PID_HOST=$!
-    ip netns exec ns_client ./qlinqd --peer 192.168.1.1:8888 --socket qlinq-data-client --track tund/tun-host --reliable > logs/client_reliable.log 2>&1 &
+    ip netns exec ns_client ./qlinqd --peer 192.168.1.1:8888 --socket qlinq-data-client --track tund/tun-host --reliable --auth-token demo --insecure-no-verify > logs/client_reliable.log 2>&1 &
     PID_CLIENT=$!
     sleep 2
 

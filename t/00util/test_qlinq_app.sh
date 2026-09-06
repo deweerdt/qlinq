@@ -19,6 +19,7 @@ trap cleanup EXIT INT TERM
 timeout 8 "$app_bin" \
     --listen 10093 --bind 127.0.0.1 \
     --idle-timeout-ms 60000 \
+    --cert t/assets/server.crt --key t/assets/server.key \
     --auth-token app-test --insecure-no-verify \
     --input README.md --message-size 512 --count 1 \
     --wait-subscribers 1 --one-shot --drain-ms 500 --mode rateless \
@@ -54,7 +55,10 @@ client_pid=
 test "$(wc -c < "$tmp_dir/output.bin")" -eq 512
 cmp -n 512 README.md "$tmp_dir/output.bin"
 awk -F '\t' 'NR == 1 { exit !($1 == "elapsed_ms" && $2 == "node" &&
-                                  $3 == "tx_records" && $4 == "rx_records") }' \
+                                  $3 == "tx_records" && $4 == "rx_records" &&
+                                  $26 == "publish_errors" && NF == 26) }' \
+    "$tmp_dir/client.tsv"
+awk -F '\t' 'NR > 1 && NF != 26 { bad=1 } END { exit bad }' \
     "$tmp_dir/client.tsv"
 awk -F '\t' '$2 == "direct-rx" && $3 == 0 && $4 == 1 && $5 == 512 { ok=1 }
               END { exit !ok }' "$tmp_dir/client.tsv"
@@ -71,6 +75,7 @@ grep -Eq 'qlinq-app: pv .+ tx .+ \[[^]]+/s\] rx .+ \[[^]]+/s\]' \
 # server-issued connection IDs.
 timeout 8 "$app_bin" \
     --listen 10094 --bind 127.0.0.1 \
+    --cert t/assets/server.crt --key t/assets/server.key \
     --auth-token fanout-test --insecure-no-verify \
     --input README.md --message-size 256 --count 1 \
     --wait-subscribers 2 --one-shot --drain-ms 500 --mode reliable \

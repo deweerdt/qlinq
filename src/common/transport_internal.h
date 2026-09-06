@@ -77,7 +77,17 @@ typedef struct {
 struct transport_t {
   transport_callback_t callback;
   void *user_data;
+  transport_log_callback_t log_callback;
+  void *log_user_data;
   bool is_server;
+  bool shutting_down;
+  bool reconnect_enabled;
+  bool reconnect_in_progress;
+  uint32_t reconnect_initial_delay_ms;
+  uint32_t reconnect_max_delay_ms;
+  uint32_t reconnect_current_delay_ms;
+  int64_t reconnect_at_ms;
+  char server_name[256];
   int fds[TRANSPORT_MAX_PATHS];
   size_t num_fds;
   struct sockaddr_storage local_addrs[TRANSPORT_MAX_PATHS];
@@ -107,8 +117,6 @@ struct transport_t {
   quicly_cid_plaintext_t next_cid;
 
   uint64_t last_pathflow_update;
-  pathflow_context_t scheduler_context;
-  size_t round_robin_path;
   transport_conn_t **conns;
   size_t conn_count;
   uint32_t next_conn_id;
@@ -169,6 +177,8 @@ struct transport_conn_t {
   uint64_t last_telemetry_s_ns[TRANSPORT_MAX_PATHS];
   uint64_t last_telemetry_r_ns[TRANSPORT_MAX_PATHS];
   bool path_state_overridden[TRANSPORT_MAX_PATHS];
+  pathflow_context_t scheduler_context;
+  size_t round_robin_path;
   transport_repair_limiter_t repair_request_limiter;
   transport_repair_limiter_t nack_request_limiter;
   transport_checkpoint_ack_state_t checkpoint_acks[UINT8_MAX + 1U];
@@ -182,6 +192,9 @@ struct transport_conn_t {
 uint64_t transport_get_time_ns(void);
 bool transport_owner_ok(transport_t *t);
 void transport_emit_event(transport_t *t, const transport_event_t *event);
+void transport_log(transport_t *t, transport_log_level_t level,
+                   const char *component, uint32_t connection_id,
+                   size_t path_index, const char *format, ...);
 void transport_release_assembler(transport_t *t, frame_assembler_t *assembler);
 bool transport_grow_assembler(transport_t *t, frame_assembler_t *assembler,
                               uint16_t symbols, uint16_t symbol_size);

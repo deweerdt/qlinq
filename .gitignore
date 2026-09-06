@@ -20,6 +20,8 @@ t/00util/test_rateless_benchmark
 t/00util/test_tc_benchmark
 t/00util/test_multipath
 t/00util/test_multipath_nack
+t/00util/test_operational
+t/00util/test_tls
 t/assets/
 *.o
 *.d

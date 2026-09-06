@@ -566,6 +566,62 @@ int main(void) {
   }
   printf("60/5/10/25 split verified successfully!\n");
 
+  /* Remove one established path at each endpoint. The physical socket and
+   * scheduler slot must disappear without taking down the connection. */
+  printf("testing interface removal while the connection remains active...\n");
+  transport_mock_iface_remove(server, "127.30.4.99");
+  transport_mock_iface_remove(client, "127.60.7.34");
+  for (int i = 0; i < 100; i++) {
+    transport_tick(server);
+    transport_tick(client);
+    drain_qlog(log_fd);
+    usleep(1000);
+  }
+  transport_path_stats_t removed_path_stats = {0};
+  if (transport_get_path_stats(server, 3, &removed_path_stats) ||
+      transport_get_path_stats(client, 3, &removed_path_stats)) {
+    fprintf(stderr, "removed interface remained scheduler-visible\n");
+    close(log_fd);
+    transport_destroy(client);
+    transport_destroy(server);
+    close(listener_fd);
+    unlink(qlog_path);
+    return 1;
+  }
+
+  client_state.object_received = false;
+  moq_object_t post_remove = {.track_id = t_video,
+                              .group_id = 999,
+                              .object_id = 999,
+                              .data = (const uint8_t *)payload,
+                              .size = strlen(payload),
+                              .is_keyframe = true};
+  if (!transport_publish(server, &post_remove)) {
+    fprintf(stderr, "publication failed after interface removal\n");
+    close(log_fd);
+    transport_destroy(client);
+    transport_destroy(server);
+    close(listener_fd);
+    unlink(qlog_path);
+    return 1;
+  }
+  retries = 1000;
+  while (retries-- > 0 && !client_state.object_received) {
+    transport_tick(server);
+    transport_tick(client);
+    drain_qlog(log_fd);
+    usleep(1000);
+  }
+  if (!client_state.object_received) {
+    fprintf(stderr, "connection did not survive interface removal\n");
+    close(log_fd);
+    transport_destroy(client);
+    transport_destroy(server);
+    close(listener_fd);
+    unlink(qlog_path);
+    return 1;
+  }
+
   /* destroy client transport to flush final trace logs to socket */
   printf("destroying client transport to flush qlog...\n");
   transport_destroy(client);

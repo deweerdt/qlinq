@@ -72,6 +72,36 @@ typedef enum {
                                        evicted */
 } transport_event_type_t;
 
+typedef enum {
+  TRANSPORT_LOG_DEBUG,
+  TRANSPORT_LOG_INFO,
+  TRANSPORT_LOG_WARNING,
+  TRANSPORT_LOG_ERROR
+} transport_log_level_t;
+
+typedef struct {
+  transport_log_level_t level;
+  const char *component;
+  uint32_t connection_id; /* zero when not connection-specific */
+  size_t path_index;      /* SIZE_MAX when not path-specific */
+  const char *message;    /* borrowed for the duration of the callback */
+} transport_log_event_t;
+
+typedef void (*transport_log_callback_t)(void *user_data,
+                                         const transport_log_event_t *event);
+
+typedef struct {
+  /* Normalized QUIC application/transport code. For an internal local error,
+   * this is the raw value and raw_error has the same value. */
+  uint64_t error_code;
+  int64_t raw_error;
+  bool application_error;
+  uint64_t offending_frame_type;
+  bool remote;
+  /* Borrowed and valid only for the duration of the event callback. */
+  const char *reason;
+} transport_disconnect_t;
+
 typedef struct {
   transport_event_type_t type;
   transport_conn_t *conn;
@@ -81,7 +111,8 @@ typedef struct {
     const uint8_t *token;
     size_t token_len;
     bool success;
-  } auth; /* valid for auth events */
+  } auth;                            /* valid for auth events */
+  transport_disconnect_t disconnect; /* valid for disconnected events */
 } transport_event_t;
 
 /* Pointers inside an event, including object.data and auth.token, are borrowed
@@ -115,6 +146,8 @@ typedef void (*transport_callback_t)(void *user_data,
 #define TRANSPORT_DEFAULT_MAX_EGRESS_BYTES (2U * 1024U * 1024U)
 #define TRANSPORT_DEFAULT_ASSEMBLER_MEMORY_BUDGET (64U * 1024U * 1024U)
 #define TRANSPORT_DEFAULT_MAX_PACKETS_PER_TICK 1024U
+#define TRANSPORT_DEFAULT_RECONNECT_INITIAL_DELAY_MS 250U
+#define TRANSPORT_DEFAULT_RECONNECT_MAX_DELAY_MS 30000U
 
 #define TRANSPORT_HARD_MAX_CONNECTIONS 1024U
 #define TRANSPORT_HARD_MAX_SUBSCRIPTIONS 256U
@@ -172,8 +205,17 @@ typedef struct {
                                production */
   transport_callback_t callback;
   void *user_data;
+  /* Optional structured diagnostics. When omitted, WARNING and ERROR records
+   * are written to stderr. The event and message are callback-borrowed. */
+  transport_log_callback_t log_callback;
+  void *log_user_data;
   uint8_t simulated_loss_rate; /* 0 to 100 representing percentage of packets to
                                   drop */
+  /* Recreate a client QUIC session after an unexpected disconnect. Servers
+   * ignore these fields. Zero delay fields select 250 ms and 30 seconds. */
+  bool reconnect_enabled;
+  uint32_t reconnect_initial_delay_ms;
+  uint32_t reconnect_max_delay_ms;
   transport_repair_mode_t repair_mode;
   transport_limits_t limits; /* zero fields select documented defaults */
 } transport_config_t;
@@ -240,10 +282,30 @@ int transport_enable_qlog(const char *socket_path);
 /* close an active connection */
 void transport_close_conn(transport_t *t, transport_conn_t *conn);
 
+/* Close every connection and suppress automatic reconnect. Call tick until
+ * transport_is_drained() or the application's drain deadline expires. */
+void transport_shutdown(transport_t *t, const char *reason);
+bool transport_is_drained(transport_t *t);
+
+/* Atomically replace the identity used by future handshakes. Existing
+ * connections are unaffected. On failure, the current identity is retained. */
+bool transport_reload_credentials(transport_t *t, const char *cert_file,
+                                  const char *key_file);
+
 /* query latest estimated bandwidth in bytes per second */
 uint64_t transport_get_estimated_bandwidth(transport_t *t);
 
+typedef enum {
+  TRANSPORT_PATH_DISCOVERED,
+  TRANSPORT_PATH_OPENING,
+  TRANSPORT_PATH_VALIDATING,
+  TRANSPORT_PATH_ACTIVE,
+  TRANSPORT_PATH_DRAINING,
+  TRANSPORT_PATH_FAILED
+} transport_path_lifecycle_t;
+
 typedef struct {
+  transport_path_lifecycle_t lifecycle;
   uint32_t interface_index;
   char interface_name[64];
   char local_address[64];
@@ -260,6 +322,9 @@ typedef struct {
   uint64_t connections_accepted;
   uint64_t connections_rejected;
   uint64_t connections_closed;
+  uint64_t reconnect_attempts;
+  uint64_t reconnect_succeeded;
+  uint64_t reconnect_failed;
   uint64_t protocol_handshakes_completed;
   uint64_t protocol_errors;
   uint64_t resource_limit_errors;
@@ -303,6 +368,13 @@ typedef struct {
   uint64_t egress_packets_queued;
   uint64_t egress_bytes_queued;
   uint64_t egress_packets_dropped;
+  uint64_t publish_delivered;
+  uint64_t publish_buffered;
+  uint64_t publish_no_recipients;
+  uint64_t publish_partial;
+  uint64_t publish_backpressure;
+  uint64_t publish_invalid;
+  uint64_t publish_errors;
   size_t egress_current_packets;
   size_t egress_current_bytes;
   size_t egress_peak_packets;
@@ -345,6 +417,7 @@ bool transport_get_path_stats(transport_t *t, size_t path_idx,
 
 /* mock a local IP interface addition for testing multipath */
 void transport_mock_iface_add(transport_t *t, const char *ip_addr);
+void transport_mock_iface_remove(transport_t *t, const char *ip_addr);
 
 /* Deterministic path controls for integration tests. The override remains in
  * effect for the lifetime of the current connections. */

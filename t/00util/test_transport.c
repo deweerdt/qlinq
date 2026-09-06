@@ -28,7 +28,31 @@ typedef struct {
   uint64_t video_object_id;
   bool protocol_ready_observed;
   uint32_t connection_id;
+  bool disconnected;
+  bool disconnect_remote;
+  uint64_t disconnect_error;
+  char disconnect_reason[128];
+  uint64_t log_records;
+  uint64_t insecure_warnings;
 } test_state_t;
+
+static void record_disconnect(test_state_t *state,
+                              const transport_event_t *event) {
+  state->disconnected = true;
+  state->disconnect_remote = event->disconnect.remote;
+  state->disconnect_error = event->disconnect.error_code;
+  snprintf(state->disconnect_reason, sizeof(state->disconnect_reason), "%s",
+           event->disconnect.reason ? event->disconnect.reason : "");
+}
+
+static void on_log(void *user_data, const transport_log_event_t *event) {
+  test_state_t *state = user_data;
+  state->log_records++;
+  if (event->level == TRANSPORT_LOG_WARNING &&
+      strcmp(event->component, "tls") == 0 &&
+      strstr(event->message, "verification is disabled"))
+    state->insecure_warnings++;
+}
 
 static void record_connection(test_state_t *state, transport_conn_t *conn) {
   transport_conn_stats_t stats;
@@ -74,6 +98,9 @@ static void on_server_event(void *user_data, const transport_event_t *event) {
     break;
   case TRANSPORT_EVENT_AUTH:
     transport_respond_auth(state->transport, event->conn, true);
+    break;
+  case TRANSPORT_EVENT_DISCONNECTED:
+    record_disconnect(state, event);
     break;
   case TRANSPORT_EVENT_UNSUBSCRIBE:
     if (event->track_id.type == MOQ_TRACK_DATA &&
@@ -179,6 +206,9 @@ static void on_client_event(void *user_data, const transport_event_t *event) {
       state->checkpoint_objects_received++;
     }
     break;
+  case TRANSPORT_EVENT_DISCONNECTED:
+    record_disconnect(state, event);
+    break;
   default:
     break;
   }
@@ -201,6 +231,18 @@ int main(void) {
     return 1;
   }
   rejected_cfg.allow_insecure_peer = true;
+  rejected_cfg.remote_hosts[0] = "127.0.0.1";
+  rejected_cfg.num_remote_hosts = 1;
+  rejected_cfg.reconnect_enabled = true;
+  rejected_cfg.reconnect_initial_delay_ms =
+      TRANSPORT_DEFAULT_RECONNECT_MAX_DELAY_MS + 1U;
+  if (transport_create(&rejected_cfg) != NULL) {
+    fprintf(stderr, "invalid reconnect backoff configuration was accepted\n");
+    return 1;
+  }
+  rejected_cfg.num_remote_hosts = 0;
+  rejected_cfg.reconnect_enabled = false;
+  rejected_cfg.reconnect_initial_delay_ms = 0;
   rejected_cfg.num_bind_hosts = TRANSPORT_MAX_PATHS + 1;
   if (transport_create(&rejected_cfg) != NULL) {
     fprintf(stderr, "oversized path configuration was accepted\n");
@@ -217,6 +259,8 @@ int main(void) {
   server_cfg.callback = on_server_event;
   server_cfg.allow_insecure_peer = true;
   server_cfg.user_data = &server_state;
+  server_cfg.log_callback = on_log;
+  server_cfg.log_user_data = &server_state;
 
   /* create client transport config */
   transport_config_t client_cfg = {0};
@@ -230,6 +274,8 @@ int main(void) {
   client_cfg.callback = on_client_event;
   client_cfg.allow_insecure_peer = true;
   client_cfg.user_data = &client_state;
+  client_cfg.log_callback = on_log;
+  client_cfg.log_user_data = &client_state;
 
   printf("creating server and client transports...\n");
   transport_t *server = transport_create(&server_cfg);
@@ -280,6 +326,14 @@ int main(void) {
       !server_state.protocol_ready_observed ||
       client_state.connection_id == 0 || server_state.connection_id == 0) {
     fprintf(stderr, "protocol handshake was not observable at connect time\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+  transport_path_stats_t connected_path = {0};
+  if (!transport_get_path_stats(client, 0, &connected_path) ||
+      connected_path.lifecycle != TRANSPORT_PATH_ACTIVE) {
+    fprintf(stderr, "connected primary path was not reported active\n");
     transport_destroy(client);
     transport_destroy(server);
     return 1;
@@ -617,8 +671,45 @@ int main(void) {
       client_stats.stream_frames_received == 0 ||
       server_stats.stream_frames_received == 0 ||
       client_stats.active_connections != 1 ||
-      server_stats.active_connections != 1) {
+      server_stats.active_connections != 1 ||
+      server_stats.publish_no_recipients == 0 ||
+      server_stats.publish_delivered == 0 ||
+      server_stats.publish_invalid == 0 ||
+      server_stats.publish_backpressure == 0 ||
+      client_state.insecure_warnings != 1 ||
+      server_state.insecure_warnings != 1) {
     fprintf(stderr, "transport observability snapshot was incomplete\n");
+    transport_destroy(client);
+    transport_destroy(server);
+    return 1;
+  }
+
+  transport_shutdown(client, "test shutdown");
+  retries = 500;
+  while (retries-- > 0 &&
+         (!transport_is_drained(client) || !transport_is_drained(server))) {
+    transport_tick(client);
+    transport_tick(server);
+    usleep(10 * 1000);
+  }
+  if (!transport_is_drained(client) || !transport_is_drained(server) ||
+      !client_state.disconnected || !server_state.disconnected ||
+      client_state.disconnect_remote || !server_state.disconnect_remote ||
+      client_state.disconnect_error != 0 ||
+      server_state.disconnect_error != 0 ||
+      strcmp(client_state.disconnect_reason, "test shutdown") != 0 ||
+      strcmp(server_state.disconnect_reason, "test shutdown") != 0) {
+    fprintf(stderr,
+            "graceful shutdown or disconnect diagnostics were incomplete "
+            "(client_drained=%d server_drained=%d client_seen=%d "
+            "server_seen=%d client_remote=%d server_remote=%d "
+            "client_error=%" PRIu64 " server_error=%" PRIu64
+            " client_reason=%s server_reason=%s)\n",
+            transport_is_drained(client), transport_is_drained(server),
+            client_state.disconnected, server_state.disconnected,
+            client_state.disconnect_remote, server_state.disconnect_remote,
+            client_state.disconnect_error, server_state.disconnect_error,
+            client_state.disconnect_reason, server_state.disconnect_reason);
     transport_destroy(client);
     transport_destroy(server);
     return 1;

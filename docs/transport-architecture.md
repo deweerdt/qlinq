@@ -65,13 +65,15 @@ absent object at a time. Cumulative ACKs release source repair-cache entries;
 if eight windows remain unacknowledged, publication reports backpressure rather
 than evicting recoverable objects.
 
-`transport_get_stats` reports protocol errors, handshake counts, FEC outcomes,
-thread-contract violations, UDP would-block/errors, and current/peak egress
-occupancy. `transport_get_conn_stats` adds stable connection IDs, negotiated
-limits, authentication state, subscriptions, and receive counters.
+`transport_get_stats` reports protocol errors, handshake and reconnect counts,
+publication outcomes, FEC and repair pressure, thread-contract violations, UDP
+would-block/errors, and current/peak egress occupancy.
+`transport_get_conn_stats` adds stable connection IDs, negotiated limits,
+authentication state, subscriptions, and receive counters.
 Checkpoint, completion, ACK, cache-release, cache-backpressure, pending-window,
 and oldest-unacknowledged-age counters expose bounded recovery behavior.
 
 Component-level tests cover these ownership and lookup boundaries. End-to-end
 tests cover connection establishment, authentication, reliable streams,
-datagrams, FEC/NACK recovery, and multipath behavior.
+datagrams, FEC/NACK recovery, IPv4/IPv6 mutual TLS, reconnect after peer
+restart, live interface removal, and multipath behavior.
