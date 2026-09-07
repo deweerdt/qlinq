@@ -1,8 +1,22 @@
 # Makefile for qlinq
 
 CC = gcc
-AR ?= ar
 ARCH = $(shell uname -m)
+UNAME_S := $(shell uname -s)
+
+ifeq ($(UNAME_S),Darwin)
+  ifeq ($(origin AR),default)
+    AR := $(shell xcrun -find ar 2>/dev/null || echo ar)
+  endif
+  OPENSSL_PREFIX ?= $(shell brew --prefix openssl@3 2>/dev/null || brew --prefix openssl 2>/dev/null || echo /opt/homebrew/opt/openssl)
+  OPENSSL_CFLAGS ?= $(shell pkg-config --cflags openssl 2>/dev/null || echo -I$(OPENSSL_PREFIX)/include)
+  OPENSSL_LIBS   ?= $(shell pkg-config --libs openssl 2>/dev/null || echo -L$(OPENSSL_PREFIX)/lib -lcrypto -lssl)
+  INCLUDES_OPENSSL = $(OPENSSL_CFLAGS)
+  LDFLAGS = $(OPENSSL_LIBS) -lpthread -ldl -lm
+else
+  INCLUDES_OPENSSL =
+  LDFLAGS = -lpthread -lrt -ldl -lm -lcrypto -lssl
+endif
 
 # Default CFLAGS for our code
 CFLAGS_COMMON = -Wvla -Wall -Wextra -std=c11 -g -D_GNU_SOURCE -D_DEFAULT_SOURCE -DPATHFLOW_ARENA_SIZE=65536
@@ -15,9 +29,7 @@ SANITIZER_FLAGS = -O1 -fno-omit-frame-pointer -fsanitize=address,undefined -fno-
 DEPFLAGS = -MD -MP
 
 # Include paths: use -isystem for quicly and picotls to suppress warning headers
-INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -Ideps/pathflow -Ideps/pathflow/solvers -isystem deps/quicly/include -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib
-
-LDFLAGS = -lpthread -lrt -ldl -lm -lcrypto -lssl
+INCLUDES = -Isrc/common -Ideps/nanors -Ideps/nanors/deps/obl -Ideps/nanorq/include -Ideps/nanorq/deps -Ideps/pathflow -Ideps/pathflow/solvers -isystem deps/quicly/include -isystem deps/quicly/deps/picotls/include -Ideps/quicly/deps/klib $(INCLUDES_OPENSSL)
 
 QUICLY_SRCS = deps/quicly/lib/quicly.c \
               deps/quicly/lib/defaults.c \
@@ -170,7 +182,7 @@ check-sanitize:
 	ASAN_OPTIONS=detect_leaks=1:halt_on_error=1 \
 	UBSAN_OPTIONS=halt_on_error=1:print_stacktrace=1 \
 	$(MAKE) check CC=clang CFLAGS="$(SANITIZER_FLAGS)" \
-		LDFLAGS="$(SANITIZER_FLAGS) -lpthread -lrt -ldl -lm -lcrypto -lssl"
+		LDFLAGS="$(SANITIZER_FLAGS) $(LDFLAGS)"
 
 soak: t/00util/test_operational t/00util/test_transport \
 	t/00util/test_multipath_nack gencerts
