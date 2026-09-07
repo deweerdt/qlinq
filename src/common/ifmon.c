@@ -449,7 +449,7 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
 
   while (next < end) {
     struct rt_msghdr *rtm = (struct rt_msghdr *)next;
-    if (rtm->rtm_msglen == 0)
+    if (rtm->rtm_msglen == 0 || (next + rtm->rtm_msglen) > end)
       break;
 
     if (rtm->rtm_type == RTM_IFINFO) {
@@ -474,7 +474,7 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
           format_mac((uint8_t *)LLADDR(sdl), sdl->sdl_alen, iface->hw_addr);
         }
         if (!is_iface_allowed(iface->name))
-          continue;
+          goto next_iface;
         list->count++;
       }
     } else if (rtm->rtm_type == RTM_NEWADDR) {
@@ -526,6 +526,7 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
         }
       }
     }
+next_iface:
     next += rtm->rtm_msglen;
   }
 
