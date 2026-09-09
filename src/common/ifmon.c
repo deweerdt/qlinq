@@ -449,7 +449,8 @@ int ifmon_list_get(ifmon_list_t *list, uint8_t *scratchpad,
 
   while (next < end) {
     struct rt_msghdr *rtm = (struct rt_msghdr *)next;
-    if (rtm->rtm_msglen == 0 || (next + rtm->rtm_msglen) > end)
+    if (rtm->rtm_msglen == 0 ||
+        rtm->rtm_msglen > (size_t)(end - next))
       break;
 
     if (rtm->rtm_type == RTM_IFINFO) {
